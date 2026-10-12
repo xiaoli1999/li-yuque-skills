@@ -2,8 +2,7 @@
 // li-yuque-skills：下载语雀知识库文档到本地、把本地 Markdown 新建到语雀。零依赖，需要 Node 18 及以上。
 // 安全约定：
 //   1. 只有「读取」和「新建」两类能力，没有修改、删除已有文档的代码。
-//   2. 新建只允许写进本机白名单（~/.li-yuque-skills/config.json，用 allow 命令添加）里的知识库；
-//      下载不限，只受账号自身权限约束。
+//   2. 新建必须先预览、用户确认后带 --yes 才写入；访问范围只受账号自身权限约束。
 //   3. cookie 只从 ~/.li-yuque-skills/yuque-session.txt 读取，只发往 yuque.com，任何时候都不打印。
 
 import fs from 'node:fs';
@@ -13,7 +12,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.5.0';
+const VERSION = '0.6.0';
 // 更新来源：GitHub 原始文件优先，访问不了时用 jsDelivr 镜像（可能滞后几小时）
 const REPO = 'xiaoli1999/li-yuque-skills';
 const BRANCH = 'master';
@@ -312,7 +311,7 @@ async function cmdWhoami() {
   console.log(`已登录：${me.name}（${me.login}）`);
 }
 
-// ---------- 本机配置（新建白名单、更新检查记录） ----------
+// ---------- 本机配置（更新检查记录） ----------
 function readConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) || {}; } catch { return {}; }
 }
@@ -321,46 +320,6 @@ function writeConfig(patch) {
   const c = { ...readConfig(), ...patch };
   fs.mkdirSync(HOME_DIR, { recursive: true });
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(c, null, 2) + '\n');
-}
-
-function readWhitelist() {
-  const c = readConfig();
-  return Array.isArray(c.addWhitelist) ? c.addWhitelist.filter(w => w && w.url) : [];
-}
-
-function writeWhitelist(list) {
-  writeConfig({ addWhitelist: list });
-}
-
-const sameBook = (url, book) => {
-  try {
-    const p = parseYuqueUrl(url);
-    return p.host === book.host && p.login === book.login && p.book === book.slug;
-  } catch { return false; }
-};
-
-async function cmdAllow(args) {
-  const link = args._[1];
-  if (!link) throw new UserError('用法：allow <知识库链接>');
-  const book = await loadBook(link);
-  const list = readWhitelist();
-  if (list.some(w => sameBook(w.url, book))) {
-    console.log(`「${book.name}」已经在新建白名单里。`);
-    return;
-  }
-  list.push({ name: book.name, url: book.url });
-  writeWhitelist(list);
-  console.log(`已加入新建白名单：${book.name}  ${book.url}`);
-}
-
-async function cmdDisallow(args) {
-  const arg = args._[1];
-  if (!arg) throw new UserError('用法：disallow <知识库名或链接>');
-  const list = readWhitelist();
-  const keep = list.filter(w => w.name !== arg && w.url !== arg);
-  if (keep.length === list.length) throw new UserError(`白名单里没有「${arg}」。`);
-  writeWhitelist(keep);
-  console.log(`已从新建白名单移除：${arg}`);
 }
 
 // ---------- 命令：books / toc ----------
@@ -394,11 +353,9 @@ async function listAllBooks() {
   return { books: out, failed };
 }
 
-// 知识库参数可以是链接，也可以是名称（按白名单和可访问的知识库匹配）
+// 知识库参数可以是链接，也可以是名称（按可访问的知识库匹配）
 async function resolveBookRef(arg) {
   if (/^https?:\/\//i.test(arg)) return arg;
-  const w = readWhitelist().find(x => x.name === arg);
-  if (w) return w.url;
   const { books } = await listAllBooks();
   const exact = books.filter(b => b.name === arg);
   const hits = exact.length ? exact : books.filter(b => normText(b.name).includes(normText(arg)));
@@ -408,10 +365,6 @@ async function resolveBookRef(arg) {
 }
 
 async function cmdBooks() {
-  const wl = readWhitelist();
-  console.log('允许新建文档的知识库（本机白名单）：');
-  if (!wl.length) console.log('  （空，需要时让用户明确同意后用 allow 添加）');
-  for (const w of wl) console.log(`  - ${w.name}：${w.url}`);
   const { books, failed } = await listAllBooks();
   let last = null;
   for (const b of books) {
@@ -543,6 +496,38 @@ async function fetchDoc(book, slug) {
   return { kind: 'skip', d, type: d.type || '未知' };
 }
 
+// ---------- 命令：read（发链接直接读，正文输出到终端给 AI，不写文件） ----------
+async function cmdRead(args) {
+  const links = args._.slice(1);
+  if (!links.length) throw new UserError('用法：read <文档链接> [更多文档链接...]');
+  for (const link of links) {
+    const book = await loadBook(await resolveBookRef(link));
+    if (!book.docSlug) {
+      // 给的是知识库链接：列出目录，让用户挑要读哪篇
+      const roots = buildTree(book.toc);
+      const lines = [];
+      const walk = (list, depth) => {
+        for (const n of list) {
+          if (depth < 3) lines.push(`${'  '.repeat(depth)}- ${n.type === 'TITLE' ? n.title + '/' : `${n.title}  ${book.url}/${n.url}`}`);
+          walk(n.children, depth + 1);
+        }
+      };
+      walk(roots, 0);
+      console.log(`这是知识库「${book.name}」的链接，不是单篇文档。目录（前三层）如下，请让用户选择要读哪一篇：\n\n${lines.join('\n')}`);
+      continue;
+    }
+    const r = await fetchDoc(book, book.docSlug);
+    const url = `${book.url}/${book.docSlug}`;
+    if (r.kind === 'skip') {
+      console.log(`「${r.d.title || url}」是${r.type}类型，暂不支持读取：${url}`);
+      continue;
+    }
+    const md = r.md.replace(/<a\b[^>]*?>(\s*?)<\/a>/g, '').trim();
+    console.log(`# ${r.d.title}\n\n> 知识库：${book.name} · 更新：${bj(r.d.content_updated_at || r.d.updated_at)} · 原文：<${url}>\n\n${md}\n`);
+    if (links.length > 1) console.log('\n---\n');
+  }
+}
+
 async function cmdPull(args) {
   const link = args._[1];
   if (!link) throw new UserError('用法：pull <知识库名、知识库链接或文档链接> [--dir 目录/子目录] [--out 本地目录]');
@@ -617,13 +602,6 @@ async function cmdPull(args) {
 }
 
 // ---------- 命令：add ----------
-function resolveBookArg(arg) {
-  const w = readWhitelist().find(x => x.name === arg);
-  if (w) return w.url;
-  if (!/^https?:\/\//i.test(arg)) throw new UserError(`白名单里没有叫「${arg}」的知识库，请用知识库链接，或先用 books 查看白名单。`);
-  return arg;
-}
-
 function randomSlug() {
   const abc = 'abcdefghijklmnopqrstuvwxyz0123456789';
   return Array.from(crypto.randomBytes(16), b => abc[b % abc.length]).join('');
@@ -631,17 +609,12 @@ function randomSlug() {
 
 async function cmdAdd(args) {
   const file = args._[1];
-  if (!file || !args.book) throw new UserError('用法：add <md文件> --book <白名单知识库名或链接> [--under 目录/子目录] [--title 标题] [--yes]');
+  if (!file || !args.book) throw new UserError('用法：add <md文件> --book <知识库名或链接> [--under 目录/子目录] [--title 标题] [--yes]');
   const abs = path.resolve(file);
   if (!fs.existsSync(abs)) throw new UserError(`文件不存在：${abs}`);
   let md = fs.readFileSync(abs, 'utf8').replace(/^﻿/, '');
 
-  const book = await loadBook(resolveBookArg(args.book));
-  const wl = readWhitelist();
-  if (!wl.some(w => sameBook(w.url, book))) {
-    const names = wl.map(w => `${w.name}（${w.url}）`).join('、') || '（白名单为空）';
-    throw new UserError(`「${book.name}」不在本机的新建白名单里，不能往里写。当前白名单：${names}\n如果用户明确要往这个知识库新建，经用户同意后运行：allow ${book.url}`);
-  }
+  const book = await loadBook(await resolveBookRef(args.book));
   const parent = args.under ? findPath(buildTree(book.toc), args.under) : null;
   if (parent && !['TITLE', 'DOC'].includes(parent.type)) throw new UserError(`「${args.under}」不是分组也不是文档，不能放在它下面。`);
 
@@ -664,7 +637,7 @@ async function cmdAdd(args) {
   const risky = locals.filter(f => f.exists && f.kind === 'attachment' && RISKY_EXT.test(f.abs));
   if (risky.length) console.log(`  注意：语雀免费账号不能上传压缩包等类型，这些附件可能失败：${risky.map(f => f.ref).join('、')}`);
   if (!args.yes) {
-    console.log('\n这是预览，还没有写入。确认无误后加 --yes 再运行一次。');
+    console.log('\n这是预览，还没有写入。请把预览给用户看，用户明确确认后加 --yes 再运行一次。');
     return;
   }
 
@@ -752,6 +725,7 @@ const SAY_EXAMPLES = `你可以这样对 AI 说：
   · 在语雀里找一下标题带「某关键词」的文档
   · 看看「某某知识库」的目录
   · 把 <知识库链接> 下载到桌面；或只下载其中「目录A/目录B」
+  · 发一个文档链接，直接问「这篇讲了什么」
   · 把这篇文档下载下来：<文档链接>
   · 把 D:\\文档\\周报.md 发到语雀「某某知识库」的「某目录」下
   · 帮我把刚才的内容整理成文档，发到语雀「某某知识库」
@@ -782,9 +756,6 @@ async function cmdGuide() {
   console.log(`② 登录：${state}`);
   if (!me) todo.push(LOGIN_STEPS);
 
-  const wl = readWhitelist();
-  console.log(`③ 新建白名单：${wl.length ? wl.map(w => w.name).join('、') : '空（只影响新建，下载不受限）'}`);
-  if (!wl.length) todo.push('要往某个知识库新建文档时，先对 AI 说「把 <知识库链接> 加入语雀新建白名单」');
 
   console.log('\n下一步：');
   if (!todo.length) console.log('  一切就绪，可以直接用了。');
@@ -797,7 +768,7 @@ async function cmdGuide() {
 async function cmdLogout() {
   if (!fs.existsSync(COOKIE_FILE)) { console.log('本机没有保存 cookie。'); return; }
   fs.rmSync(COOKIE_FILE, { force: true });
-  console.log(`已删除本机保存的 cookie：${COOKIE_FILE}。白名单保留。`);
+  console.log(`已删除本机保存的 cookie：${COOKIE_FILE}。`);
 }
 
 // ---------- 命令：version / update（从 GitHub 更新 skill 自身） ----------
@@ -872,7 +843,7 @@ async function cmdUpdate() {
   }
   writeConfig({ updateCheck: { at: Date.now(), latest } });
   console.log(`已从 ${VERSION} 更新到 ${latest}：${SKILL_ROOT}`);
-  console.log('新开一个对话后生效。cookie 和白名单不受影响。');
+  console.log('新开一个对话后生效。cookie 不受影响。');
 }
 
 // 每天最多查一次新版本，有就在命令末尾提醒一句；失败不打扰
@@ -894,26 +865,24 @@ const HELP = `li-yuque-skills ${VERSION}：语雀知识库下载 / 新建文档
 用法：node yuque.mjs <命令> [参数]
 第一次用、或不知道下一步做什么：运行 guide
 
-  guide                       使用引导：检查安装、登录、白名单状态，给出下一步和示例说法
+  guide                       使用引导：检查安装和登录状态，给出下一步和示例说法
   login                      首次登录或更新 cookie：从剪贴板读取，校验后保存（不会显示 cookie）
   logout                      删除本机保存的 cookie
   whoami                      查看当前登录的语雀账号
   version                     查看当前版本、安装位置，并检查新版本
   update                      从 GitHub 更新本 skill 到最新版
-  books                       列出新建白名单、我的知识库和团队/空间知识库
-  allow <知识库链接>           把知识库加入本机新建白名单（须用户明确同意）
-  disallow <知识库名或链接>     从本机新建白名单移除
+  books                       列出我的知识库和团队/空间知识库
+  read <文档链接...>           直接读取文档正文（输出到终端，不写文件）
   search <关键词> [--book 知识库名或链接] [--limit 条数]
                               按目录和标题模糊搜索文档（不填 --book 则搜全部可访问的知识库）
   toc  <知识库名或链接> [--dir 目录/子目录] [--depth 层数]
                               查看目录结构
   pull <知识库名、知识库链接或文档链接> [--dir 目录/子目录] [--out 本地目录] [--yes]
                               下载为 Markdown，图片存到同目录 img/
-  add  <md文件> --book <白名单知识库名或链接> [--under 目录/子目录] [--title 标题] [--yes]
+  add  <md文件> --book <知识库名或链接> [--under 目录/子目录] [--title 标题] [--yes]
                               新建文档；不加 --yes 只预览不写入
 
-cookie 位置：${COOKIE_FILE}
-白名单配置：${CONFIG_FILE}`;
+cookie 位置：${COOKIE_FILE}`;
 
 async function main() {
   const major = Number(process.versions.node.split('.')[0]);
@@ -922,7 +891,7 @@ async function main() {
   const cmd = args._[0];
   const table = {
     guide: cmdGuide, login: cmdLogin, logout: cmdLogout, whoami: cmdWhoami, version: cmdVersion, update: cmdUpdate,
-    books: cmdBooks, search: cmdSearch, allow: cmdAllow, disallow: cmdDisallow, toc: cmdToc, pull: cmdPull, add: cmdAdd,
+    books: cmdBooks, search: cmdSearch, read: cmdRead, toc: cmdToc, pull: cmdPull, add: cmdAdd,
   };
   if (!cmd || args.help || !table[cmd]) { console.log(HELP); return; }
   await table[cmd](args);

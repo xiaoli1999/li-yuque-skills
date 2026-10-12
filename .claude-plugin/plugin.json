@@ -2,7 +2,7 @@
   "name": "li-yuque-skills",
   "displayName": "语雀文档下载与新建",
   "description": "把语雀知识库下载成本地 Markdown，或把本地 Markdown 新建为语雀文档。只能下载和新建，不能修改或删除。",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "author": { "name": "xiaoli1999" },
   "homepage": "https://github.com/xiaoli1999/li-yuque-skills",
   "repository": "https://github.com/xiaoli1999/li-yuque-skills",
