@@ -13,7 +13,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 // 更新来源：GitHub 原始文件优先，访问不了时用 jsDelivr 镜像（可能滞后几小时）
 const REPO = 'xiaoli1999/li-yuque-skills';
 const BRANCH = 'master';
@@ -631,17 +631,23 @@ const cmpVer = (a, b) => {
 };
 const versionOf = src => (/const VERSION = '([^']+)'/.exec(src) || [])[1] || null;
 
-// 按镜像顺序下载一个仓库文件；不带 cookie
-async function fetchRemote(p, timeout) {
-  let last;
-  for (const m of MIRRORS) {
-    try {
-      const res = await fetch(m(p), { headers: { 'user-agent': UA }, signal: AbortSignal.timeout(timeout) });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.text();
-    } catch (e) { last = e; }
-  }
-  throw new Error(`访问 GitHub 和镜像都失败（${last && last.message}）`);
+// 从一个来源下载仓库文件；不带 cookie
+async function fetchFrom(mirror, p, timeout) {
+  const res = await fetch(mirror(p), { headers: { 'user-agent': UA }, signal: AbortSignal.timeout(timeout) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.text();
+}
+
+// 同时问 GitHub 和镜像，取版本最高的那个（两边都可能有几分钟到几小时的缓存）
+async function fetchLatest(timeout) {
+  const rs = await Promise.allSettled(MIRRORS.map(m => fetchFrom(m, REMOTE_FILES['scripts/yuque.mjs'], timeout)));
+  let best = null;
+  rs.forEach((r, i) => {
+    const v = r.status === 'fulfilled' ? versionOf(r.value) : null;
+    if (v && (!best || cmpVer(v, best.version) > 0)) best = { version: v, script: r.value, mirror: MIRRORS[i] };
+  });
+  if (!best) throw new Error(`访问 GitHub 和镜像都失败（${rs.map(r => r.reason && r.reason.message).filter(Boolean).join('；')}）`);
+  return best;
 }
 
 const isPluginInstall = () => /[\\/]plugins[\\/]/.test(SKILL_ROOT);
@@ -650,7 +656,7 @@ async function cmdVersion() {
   console.log(`li-yuque-skills 当前版本 ${VERSION}`);
   console.log(`安装位置：${SKILL_ROOT}${isPluginInstall() ? '（Claude Code 插件方式安装）' : ''}`);
   try {
-    const latest = versionOf(await fetchRemote(REMOTE_FILES['scripts/yuque.mjs'], 10000));
+    const latest = (await fetchLatest(10000)).version;
     writeConfig({ updateCheck: { at: Date.now(), latest } });
     console.log(latest && cmpVer(latest, VERSION) > 0 ? `最新版本 ${latest}，可以更新。` : `已是最新版本（GitHub 上为 ${latest}）。`);
   } catch (e) {
@@ -667,9 +673,10 @@ async function cmdUpdate() {
   if (!fs.existsSync(skillMd) || !/^name:\s*li-yuque-skills\s*$/m.test(fs.readFileSync(skillMd, 'utf8'))) {
     throw new UserError(`没在 ${SKILL_ROOT} 找到 li-yuque-skills 的 SKILL.md，无法自动更新。`);
   }
-  const got = {};
-  for (const [rel, p] of Object.entries(REMOTE_FILES)) got[rel] = await fetchRemote(p, 30000);
-  const latest = versionOf(got['scripts/yuque.mjs']);
+  // SKILL.md 和脚本取自同一个来源，保证是同一版本
+  const best = await fetchLatest(30000);
+  const got = { 'SKILL.md': await fetchFrom(best.mirror, REMOTE_FILES['SKILL.md'], 30000), 'scripts/yuque.mjs': best.script };
+  const latest = best.version;
   if (!latest || !/^---\r?\nname:\s*li-yuque-skills/.test(got['SKILL.md'])) throw new UserError('下载到的文件不完整，已放弃更新。');
   if (cmpVer(latest, VERSION) <= 0) {
     writeConfig({ updateCheck: { at: Date.now(), latest } });
@@ -697,7 +704,7 @@ async function notifyUpdate() {
     const c = readConfig().updateCheck || {};
     let latest = c.latest;
     if (!c.at || Date.now() - c.at > 24 * 3600e3) {
-      latest = versionOf(await fetchRemote(REMOTE_FILES['scripts/yuque.mjs'], 4000));
+      latest = (await fetchLatest(4000)).version;
       writeConfig({ updateCheck: { at: Date.now(), latest } });
     }
     if (latest && cmpVer(latest, VERSION) > 0) console.log(`\n提示：li-yuque-skills 有新版本 ${latest}（当前 ${VERSION}），对 AI 说「更新语雀 skill」即可更新。`);
