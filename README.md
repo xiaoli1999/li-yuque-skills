@@ -53,6 +53,7 @@ claude plugin install li-yuque-skills@li-yuque-skills
 - 「语雀登录，cookie 已复制」——首次使用。在浏览器开发者工具（F12 → 应用 → Cookie → `https://www.yuque.com`）里复制 `_yuque_session` 的值，**不要粘贴进对话**，AI 会从剪贴板读取。登录一次长期有效，直到语雀登录过期。
 - 「把 https://www.yuque.com/xxx/yyy 这个知识库下载到桌面」
 - 「下载这个知识库里『产品资料/报价』这个目录：https://www.yuque.com/xxx/yyy」
+- 「在语雀里找一下标题带『周报』的文档」——按目录和标题模糊搜索，多个关键词用空格分开；说明在哪个知识库会更快
 - 「列出我能访问的语雀知识库」——包括个人、团队和企业空间（`xxx.yuque.com`）的知识库
 - 「把 https://www.yuque.com/xxx/yyy 加入语雀新建白名单」——新建前需要先加一次
 - 「把 D:\文档\周报.md 发到语雀『某某知识库』」——AI 会先给你看预览，你确认后才发布

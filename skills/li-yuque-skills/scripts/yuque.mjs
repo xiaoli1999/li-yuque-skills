@@ -13,7 +13,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 // 更新来源：GitHub 原始文件优先，访问不了时用 jsDelivr 镜像（可能滞后几小时）
 const REPO = 'xiaoli1999/li-yuque-skills';
 const BRANCH = 'master';
@@ -364,19 +364,13 @@ async function cmdDisallow(args) {
 }
 
 // ---------- 命令：books / toc ----------
-async function cmdBooks() {
-  const wl = readWhitelist();
-  console.log('允许新建文档的知识库（本机白名单）：');
-  if (!wl.length) console.log('  （空，需要时让用户明确同意后用 allow 添加）');
-  for (const w of wl) console.log(`  - ${w.name}：${w.url}`);
+// 列出能访问的知识库：我的 + 语雀主站团队 + 各企业空间（xxx.yuque.com）团队
+async function listAllBooks() {
   const isBook = b => String(b.type || 'Book') === 'Book' && b.slug;
-  const line = (host, login, b) => `  - ${b.name}：https://${host}/${(b.user && b.user.login) || login}/${b.slug}`;
-
+  const out = [];
   const mine = ((await yq('https://www.yuque.com/api/mine/books?limit=100&offset=0')).data || []).filter(isBook);
-  console.log(`\n我的知识库（${mine.length} 个）：`);
-  for (const b of mine) console.log(line('www.yuque.com', '', b));
+  for (const b of mine) out.push({ name: b.name, url: `https://www.yuque.com/${(b.user && b.user.login) || ''}/${b.slug}`, group: '我的知识库' });
 
-  // 团队知识库：语雀主站的团队 + 各个企业空间（如 xxx.yuque.com）里的团队
   const hosts = [{ host: 'www.yuque.com', label: '语雀' }];
   for (const o of (await yq('https://www.yuque.com/api/mine/organizations')).data || []) {
     try {
@@ -384,26 +378,132 @@ async function cmdBooks() {
       if (HOST_RE.test(h) && h !== 'www.yuque.com') hosts.push({ host: h, label: `${o.name}（${h}）` });
     } catch { /* 跳过无效地址 */ }
   }
+  const failed = [];
   for (const { host, label } of hosts) {
     let groups = [];
     try { groups = (await yq(`https://${host}/api/mine/groups`)).data || []; } catch (e) {
       if (e instanceof LoginError) throw e;
-      console.log(`\n${label}：读取团队失败（${e.message}）`);
+      failed.push(`${label}：读取团队失败（${e.message}）`);
       continue;
     }
     for (const g of groups) {
       const books = ((await yq(`https://${host}/api/groups/${g.id}/books?offset=0&limit=200`)).data || []).filter(isBook);
-      console.log(`\n团队「${g.name}」· ${label}（${books.length} 个）：`);
-      for (const b of books) console.log(line(host, g.login, b));
+      for (const b of books) out.push({ name: b.name, url: `https://${host}/${(b.user && b.user.login) || g.login}/${b.slug}`, group: `团队「${g.name}」· ${label}` });
     }
   }
+  return { books: out, failed };
+}
+
+// 知识库参数可以是链接，也可以是名称（按白名单和可访问的知识库匹配）
+async function resolveBookRef(arg) {
+  if (/^https?:\/\//i.test(arg)) return arg;
+  const w = readWhitelist().find(x => x.name === arg);
+  if (w) return w.url;
+  const { books } = await listAllBooks();
+  const exact = books.filter(b => b.name === arg);
+  const hits = exact.length ? exact : books.filter(b => normText(b.name).includes(normText(arg)));
+  if (hits.length === 1) return hits[0].url;
+  if (!hits.length) throw new UserError(`没找到名为「${arg}」的知识库。可以先运行 books 查看，或直接给知识库链接。`);
+  throw new UserError(`有多个知识库匹配「${arg}」：\n${hits.map(b => `  - ${b.name}：${b.url}（${b.group}）`).join('\n')}\n请用完整名称或链接。`);
+}
+
+async function cmdBooks() {
+  const wl = readWhitelist();
+  console.log('允许新建文档的知识库（本机白名单）：');
+  if (!wl.length) console.log('  （空，需要时让用户明确同意后用 allow 添加）');
+  for (const w of wl) console.log(`  - ${w.name}：${w.url}`);
+  const { books, failed } = await listAllBooks();
+  let last = null;
+  for (const b of books) {
+    if (b.group !== last) {
+      console.log(`\n${b.group}（${books.filter(x => x.group === b.group).length} 个）：`);
+      last = b.group;
+    }
+    console.log(`  - ${b.name}：${b.url}`);
+  }
+  for (const f of failed) console.log(`\n${f}`);
   console.log('\n以上都可以下载（只要账号有权限）；别人单独共享给你的知识库可能不在列表里，直接用链接即可。');
+}
+
+// ---------- 命令：search（按目录和标题模糊搜索） ----------
+// 归一化：全角转半角、转小写、去掉空白和常见标点，便于中英文混合匹配
+function normText(s) {
+  return String(s || '').normalize('NFKC').toLowerCase().replace(/[\s\-_·.,，。、:：;；!！?？'"“”‘’()（）\[\]【】<>《》/\\|]+/g, '');
+}
+
+// 按顺序出现即可（如「AI协作」能匹配「AI开发协作」）
+function isSubseq(q, s) {
+  let i = 0;
+  for (const ch of s) if (ch === q[i]) i++;
+  return i === q.length;
+}
+
+// 打分：标题完全相同 > 标题包含整个关键词 > 标题包含全部词 > 路径包含 > 按顺序出现；0 表示不匹配
+function matchScore(query, title, fullPath) {
+  const q = normText(query), t = normText(title), p = normText(fullPath);
+  const terms = String(query).split(/\s+/).map(normText).filter(Boolean);
+  if (!q) return 0;
+  if (t === q) return 100;
+  if (t.includes(q)) return 90;
+  if (terms.length > 1 && terms.every(x => t.includes(x))) return 80;
+  if (p.includes(q)) return 70;
+  if (terms.every(x => p.includes(x))) return 60;
+  if (q.length >= 2 && isSubseq(q, t)) return 50;
+  if (q.length >= 2 && isSubseq(q, p)) return 40;
+  return 0;
+}
+
+async function cmdSearch(args) {
+  const query = args._.slice(1).join(' ').trim();
+  if (!query) throw new UserError('用法：search <关键词> [--book 知识库名或链接] [--limit 条数]');
+  const limit = Number(args.limit) || 20;
+  let targets;
+  if (args.book) targets = [{ url: await resolveBookRef(args.book) }];
+  else {
+    const { books } = await listAllBooks();
+    targets = books;
+    console.log(`在 ${books.length} 个知识库里搜索「${query}」（按目录和标题），约需 ${Math.ceil(books.length * 1.2)} 秒……`);
+  }
+  const hits = [];
+  const failed = [];
+  for (const t of targets) {
+    let book;
+    try { book = await loadBook(t.url); } catch (e) {
+      if (e instanceof LoginError) throw e;
+      failed.push(`${t.name || t.url}：${e.message}`);
+      continue;
+    }
+    // 先看标题本身是否匹配；标题不匹配时才看「知识库/目录/标题」整条路径。
+    // 某个目录的标题已经命中时，它下面的内容只在自己标题也匹配时才列出，避免整棵子树刷屏。
+    const walk = (list, trail, coveredByAncestor) => {
+      for (const n of list) {
+        let own = 0;
+        if (n.type === 'TITLE' || n.type === 'DOC') {
+          const dirPath = trail.join('/');
+          own = matchScore(query, n.title, n.title);
+          const score = own || (coveredByAncestor ? 0 : matchScore(query, n.title, `${book.name}/${dirPath}/${n.title}`));
+          if (score) hits.push({ score, book, node: n, dirPath });
+        }
+        walk(n.children, [...trail, n.title], coveredByAncestor || own > 0);
+      }
+    };
+    walk(buildTree(book.toc), [], false);
+  }
+  hits.sort((a, b) => b.score - a.score || a.dirPath.localeCompare(b.dirPath, 'zh'));
+  console.log(`\n找到 ${hits.length} 条${hits.length > limit ? `，显示前 ${limit} 条` : ''}：`);
+  for (const h of hits.slice(0, limit)) {
+    const where = `${h.book.name}${h.dirPath ? ' › ' + h.dirPath.split('/').join(' › ') : ''}`;
+    if (h.node.type === 'DOC') console.log(`  - [文档] ${h.node.title}\n      位置：${where}\n      链接：${h.book.url}/${h.node.url}`);
+    else console.log(`  - [目录] ${h.node.title}/\n      位置：${where}\n      下载这个目录：pull ${h.book.url} --dir "${[...(h.dirPath ? h.dirPath.split('/') : []), h.node.title].join('/')}"`);
+  }
+  if (!hits.length) console.log('  没有匹配的目录或标题。可以换个关键词、减少字数，或用空格分开多个词。');
+  for (const f of failed) console.log(`  （跳过 ${f}）`);
 }
 
 async function cmdToc(args) {
   const link = args._[1];
-  if (!link) throw new UserError('用法：toc <知识库链接> [--dir 目录/子目录] [--depth 层数]');
-  const book = await loadBook(link);
+  if (!link) throw new UserError('用法：toc <知识库名或链接> [--dir 目录/子目录] [--depth 层数]');
+  const book = await loadBook(await resolveBookRef(link));
   const roots = buildTree(book.toc);
   const start = args.dir ? findPath(roots, args.dir).children : roots;
   const maxDepth = args.depth ? Number(args.depth) : Infinity;
@@ -445,8 +545,8 @@ async function fetchDoc(book, slug) {
 
 async function cmdPull(args) {
   const link = args._[1];
-  if (!link) throw new UserError('用法：pull <知识库或文档链接> [--dir 目录/子目录] [--out 本地目录]');
-  const book = await loadBook(link);
+  if (!link) throw new UserError('用法：pull <知识库名、知识库链接或文档链接> [--dir 目录/子目录] [--out 本地目录]');
+  const book = await loadBook(await resolveBookRef(link));
   const roots = buildTree(book.toc);
   const outRoot = path.resolve(args.out || path.join(process.cwd(), safeName(book.name)));
 
@@ -649,6 +749,7 @@ const LOGIN_STEPS = `登录语雀（cookie 只在剪贴板里交给 AI，不要�
 
 const SAY_EXAMPLES = `你可以这样对 AI 说：
   · 列出我能访问的语雀知识库
+  · 在语雀里找一下标题带「某关键词」的文档
   · 看看「某某知识库」的目录
   · 把 <知识库链接> 下载到桌面；或只下载其中「目录A/目录B」
   · 把这篇文档下载下来：<文档链接>
@@ -802,9 +903,11 @@ const HELP = `li-yuque-skills ${VERSION}：语雀知识库下载 / 新建文档
   books                       列出新建白名单、我的知识库和团队/空间知识库
   allow <知识库链接>           把知识库加入本机新建白名单（须用户明确同意）
   disallow <知识库名或链接>     从本机新建白名单移除
-  toc  <知识库链接> [--dir 目录/子目录] [--depth 层数]
+  search <关键词> [--book 知识库名或链接] [--limit 条数]
+                              按目录和标题模糊搜索文档（不填 --book 则搜全部可访问的知识库）
+  toc  <知识库名或链接> [--dir 目录/子目录] [--depth 层数]
                               查看目录结构
-  pull <知识库或文档链接> [--dir 目录/子目录] [--out 本地目录]
+  pull <知识库名、知识库链接或文档链接> [--dir 目录/子目录] [--out 本地目录] [--yes]
                               下载为 Markdown，图片存到同目录 img/
   add  <md文件> --book <白名单知识库名或链接> [--under 目录/子目录] [--title 标题] [--yes]
                               新建文档；不加 --yes 只预览不写入
@@ -819,7 +922,7 @@ async function main() {
   const cmd = args._[0];
   const table = {
     guide: cmdGuide, login: cmdLogin, logout: cmdLogout, whoami: cmdWhoami, version: cmdVersion, update: cmdUpdate,
-    books: cmdBooks, allow: cmdAllow, disallow: cmdDisallow, toc: cmdToc, pull: cmdPull, add: cmdAdd,
+    books: cmdBooks, search: cmdSearch, allow: cmdAllow, disallow: cmdDisallow, toc: cmdToc, pull: cmdPull, add: cmdAdd,
   };
   if (!cmd || args.help || !table[cmd]) { console.log(HELP); return; }
   await table[cmd](args);
