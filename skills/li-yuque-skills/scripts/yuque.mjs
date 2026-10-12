@@ -13,7 +13,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.3.1';
+const VERSION = '0.4.0';
 // 更新来源：GitHub 原始文件优先，访问不了时用 jsDelivr 镜像（可能滞后几小时）
 const REPO = 'xiaoli1999/li-yuque-skills';
 const BRANCH = 'master';
@@ -77,19 +77,24 @@ function readClipboard() {
 }
 
 // ---------- 请求 ----------
+// 频率控制：语雀没有公开网页接口的频率上限，这里按接近人工浏览的节奏走——
+// 接口请求之间随机间隔 0.8～1.5 秒、串行；遇到限流按 30/60/120 秒退避，仍不行就停下。
+const API_GAP = [800, 1500];
+const BACKOFF = [30, 60, 120];
+const LARGE_PULL = 200; // 一次下载超过这么多篇，必须用户确认（--yes）
 let lastCall = 0;
-async function pace() {
-  const wait = lastCall + 200 - Date.now();
+async function pace(gap = API_GAP) {
+  const wait = lastCall + gap[0] + Math.random() * (gap[1] - gap[0]) - Date.now();
   if (wait > 0) await sleep(wait);
   lastCall = Date.now();
 }
+const isThrottled = (status, text) => status === 429 || status === 503 || (status >= 400 && /频繁|too many|rate.?limit/i.test(text || ''));
 
 async function yq(url, { method = 'GET', json, body, session } = {}) {
   const u = new URL(url);
   // cookie 只允许发往语雀
   if (u.protocol !== 'https:' || !HOST_RE.test(u.hostname)) throw new UserError(`只允许访问 yuque.com，拒绝：${u.hostname}`);
   const token = session || readCookie();
-  await pace();
   const isApi = u.pathname.startsWith('/api/');
   const headers = {
     'user-agent': UA,
@@ -107,14 +112,26 @@ async function yq(url, { method = 'GET', json, body, session } = {}) {
     payload = JSON.stringify(json);
   }
   // 不跟随跳转，避免 cookie 被带到别处；跳到登录页说明登录失效
-  const res = await fetch(u, { method, headers, body: payload, redirect: 'manual' });
+  let res, text;
+  for (let attempt = 0; ; attempt++) {
+    await pace();
+    res = await fetch(u, { method, headers, body: payload, redirect: 'manual' });
+    if (!isThrottled(res.status, '')) break;
+    text = await res.text();
+    if (attempt >= BACKOFF.length) {
+      throw new UserError('语雀提示访问过于频繁，已停止。请至少过 1 小时再试，期间不要重复运行或同时开多个任务。');
+    }
+    console.log(`语雀提示访问过于频繁（${res.status}），等待 ${BACKOFF[attempt]} 秒后重试……`);
+    await sleep(BACKOFF[attempt] * 1000);
+  }
   if (res.status >= 300 && res.status < 400) {
     const loc = res.headers.get('location') || '';
     if (/login/i.test(loc)) throw new LoginError('语雀登录已失效。');
     throw new UserError(`语雀返回跳转（${res.status}），链接可能不对：${u.pathname}`);
   }
   if (res.status === 401) throw new LoginError('语雀登录已失效。');
-  const text = await res.text();
+  text = await res.text();
+  if (isThrottled(res.status, text)) throw new UserError('语雀提示访问过于频繁，已停止。请至少过 1 小时再试，期间不要重复运行或同时开多个任务。');
   if (!isApi) {
     if (res.status === 404) throw new UserError(`页面不存在（404），检查链接：${u.href}`);
     if (!res.ok) throw new UserError(`语雀返回 ${res.status}：${u.pathname}`);
@@ -251,6 +268,7 @@ async function localizeImages(md, absDir, prefix, stat) {
   let i = 0;
   for (const url of urls) {
     i++;
+    if (i > 1) await sleep(250); // 图片走 CDN，也别连发
     try {
       const clean = url.split('#')[0];
       // 图片在公开 CDN 上，不带 cookie
@@ -457,7 +475,13 @@ async function cmdPull(args) {
   }
 
   console.log(`知识库：${book.name}  ${book.url}`);
-  console.log(`共 ${plan.length} 篇，保存到：${outRoot}\n`);
+  const minutes = Math.max(1, Math.round(plan.length * 1.6 / 60));
+  if (plan.length > LARGE_PULL && !args.yes) {
+    console.log(`共 ${plan.length} 篇，预计 ${minutes} 分钟以上。篇数较多，为避免触发语雀的访问频率限制，需要用户确认。`);
+    console.log('建议只下载需要的目录（--dir）。用户确认要全部下载后，加 --yes 再运行。');
+    return;
+  }
+  console.log(`共 ${plan.length} 篇，预计约 ${minutes} 分钟，保存到：${outRoot}\n`);
   const stat = { ok: 0, board: 0, img: 0, imgFail: 0 };
   for (let i = 0; i < plan.length; i++) {
     const p = plan[i];
@@ -616,6 +640,58 @@ async function uploadFile(book, docId, abs, kind) {
   return u;
 }
 
+// ---------- 命令：guide（使用引导：检查状态，告诉用户下一步怎么做） ----------
+const LOGIN_STEPS = `登录语雀（cookie 只在剪贴板里交给 AI，不要粘贴到对话里）：
+     a. 用 Chrome 或 Edge 打开 https://www.yuque.com 并登录（公司空间的同事也在这里登录）
+     b. 按 F12 →「应用」（Application）→ 左侧「Cookie」→ https://www.yuque.com
+     c. 找到 _yuque_session，双击「值」一栏，全选复制
+     d. 对 AI 说「语雀登录，cookie 已复制」`;
+
+const SAY_EXAMPLES = `你可以这样对 AI 说：
+  · 列出我能访问的语雀知识库
+  · 看看「某某知识库」的目录
+  · 把 <知识库链接> 下载到桌面；或只下载其中「目录A/目录B」
+  · 把这篇文档下载下来：<文档链接>
+  · 把 D:\\文档\\周报.md 发到语雀「某某知识库」的「某目录」下
+  · 帮我把刚才的内容整理成文档，发到语雀「某某知识库」
+  · 更新语雀 skill ／ 更新语雀 cookie，已复制 ／ 删除语雀 cookie`;
+
+async function cmdGuide() {
+  console.log(`li-yuque-skills v${VERSION} · 使用引导\n`);
+  const todo = [];
+
+  let latest = null;
+  try {
+    latest = (await fetchLatest(6000)).version;
+    writeConfig({ updateCheck: { at: Date.now(), latest } });
+  } catch { /* 网络不通不影响引导 */ }
+  const outdated = latest && cmpVer(latest, VERSION) > 0;
+  console.log(`① 安装：v${VERSION}，Node ${process.versions.node}${outdated ? `；有新版本 v${latest}` : latest ? '；已是最新' : ''}`);
+  if (outdated) todo.push('对 AI 说「更新语雀 skill」，更新到最新版');
+
+  let me = null, state = '未登录';
+  if (fs.existsSync(COOKIE_FILE)) {
+    try {
+      me = await whoami();
+      state = `已登录：${me.name}（${me.login}）`;
+    } catch (e) {
+      state = e instanceof LoginError ? '登录已失效，需要重新登录' : `无法确认（${e.message}）`;
+    }
+  }
+  console.log(`② 登录：${state}`);
+  if (!me) todo.push(LOGIN_STEPS);
+
+  const wl = readWhitelist();
+  console.log(`③ 新建白名单：${wl.length ? wl.map(w => w.name).join('、') : '空（只影响新建，下载不受限）'}`);
+  if (!wl.length) todo.push('要往某个知识库新建文档时，先对 AI 说「把 <知识库链接> 加入语雀新建白名单」');
+
+  console.log('\n下一步：');
+  if (!todo.length) console.log('  一切就绪，可以直接用了。');
+  todo.forEach((t, i) => console.log(`  ${i + 1}. ${t}`));
+  console.log(`\n${SAY_EXAMPLES}`);
+  console.log('\n提醒：新建前会先给你看预览，你确认后才发布；不要短时间内反复下载整个知识库，以免触发语雀的访问频率限制。');
+}
+
 // ---------- 命令：logout ----------
 async function cmdLogout() {
   if (!fs.existsSync(COOKIE_FILE)) { console.log('本机没有保存 cookie。'); return; }
@@ -715,8 +791,10 @@ async function notifyUpdate() {
 const HELP = `li-yuque-skills ${VERSION}：语雀知识库下载 / 新建文档
 
 用法：node yuque.mjs <命令> [参数]
+第一次用、或不知道下一步做什么：运行 guide
 
-  login                       首次登录或更新 cookie：从剪贴板读取，校验后保存（不会显示 cookie）
+  guide                       使用引导：检查安装、登录、白名单状态，给出下一步和示例说法
+  login                      首次登录或更新 cookie：从剪贴板读取，校验后保存（不会显示 cookie）
   logout                      删除本机保存的 cookie
   whoami                      查看当前登录的语雀账号
   version                     查看当前版本、安装位置，并检查新版本
@@ -740,17 +818,17 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const cmd = args._[0];
   const table = {
-    login: cmdLogin, logout: cmdLogout, whoami: cmdWhoami, version: cmdVersion, update: cmdUpdate,
+    guide: cmdGuide, login: cmdLogin, logout: cmdLogout, whoami: cmdWhoami, version: cmdVersion, update: cmdUpdate,
     books: cmdBooks, allow: cmdAllow, disallow: cmdDisallow, toc: cmdToc, pull: cmdPull, add: cmdAdd,
   };
   if (!cmd || args.help || !table[cmd]) { console.log(HELP); return; }
   await table[cmd](args);
-  if (!['version', 'update', 'logout'].includes(cmd)) await notifyUpdate();
+  if (!['guide', 'version', 'update', 'logout'].includes(cmd)) await notifyUpdate();
 }
 
 main().catch(e => {
   if (e instanceof LoginError) {
-    console.error(`${e.message}\n请在浏览器登录语雀，复制 cookie「_yuque_session」的值，然后运行：node yuque.mjs login`);
+    console.error(`${e.message}\n${LOGIN_STEPS}\n复制好后运行：node yuque.mjs login`);
     process.exit(2);
   }
   if (e instanceof UserError) {

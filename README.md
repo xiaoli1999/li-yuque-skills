@@ -49,6 +49,7 @@ claude plugin install li-yuque-skills@li-yuque-skills
 
 直接对 AI 说：
 
+- 「语雀 skill 怎么用」——不知道从哪开始时说这句，AI 会检查安装、登录、白名单状态，告诉你下一步和可以怎么说
 - 「语雀登录，cookie 已复制」——首次使用。在浏览器开发者工具（F12 → 应用 → Cookie → `https://www.yuque.com`）里复制 `_yuque_session` 的值，**不要粘贴进对话**，AI 会从剪贴板读取。登录一次长期有效，直到语雀登录过期。
 - 「把 https://www.yuque.com/xxx/yyy 这个知识库下载到桌面」
 - 「下载这个知识库里『产品资料/报价』这个目录：https://www.yuque.com/xxx/yyy」
@@ -61,6 +62,16 @@ claude plugin install li-yuque-skills@li-yuque-skills
 - **更新 skill**：对 AI 说「更新语雀 skill」。脚本每天最多检查一次新版本，有新版时会在命令结果末尾提醒。插件方式安装的用 `claude plugin update li-yuque-skills@li-yuque-skills`。
 - **更新 cookie**：cookie 过期或想换账号时，重新复制 `_yuque_session`，对 AI 说「更新语雀 cookie，已复制」。
 - 更新 skill 不影响 cookie 和白名单。
+
+## 访问频率与账号风险
+
+语雀没有公开网页接口的频率上限。它的[开放 API 文档](https://www.yuque.com/yuque/developer/api)写明"系统识别异常行为后会进行屏蔽处理，可能会导致用户不可用"；[服务协议](https://www.yuque.com/terms)第三条约定不得使用未经授权的第三方工具对服务"施加其他影响"，第九条约定违反协议或出于安全原因时可中断、终止服务。因此本工具：
+
+- 串行请求，接口之间随机间隔 0.8～1.5 秒（约 1 次/秒，接近人工浏览）；图片之间间隔 0.25 秒；
+- 遇到限流（429 / 503 / "频繁"）按 30、60、120 秒退避，仍不行就停下，提示至少 1 小时后再试；
+- 一次下载超过 200 篇时要求确认。
+
+日常按需下载、偶尔新建，风险很低；但请不要循环、定时或多开批量下载，也不要短时间反复全量下载同一个知识库。**无法保证不被限制，风险由使用者自行承担。**
 
 ## 数据与安全
 
