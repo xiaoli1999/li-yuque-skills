@@ -1,94 +1,69 @@
 ---
 name: li-yuque-skills
-description: 语雀文档工具。把语雀知识库（整库、某个目录或单篇）下载成本地 Markdown，或把本地 Markdown 新建为语雀文档。用户提到语雀、yuque.com 链接、"下载语雀文档"、"发到语雀"、"传到语雀"、"同步到语雀"时使用。只能下载和新建，不能修改或删除已有文档。
-license: MIT
-compatibility: 需要 Node.js 18 及以上，并能访问 www.yuque.com；用于 Claude Code、Codex、Cursor 等能在本机执行命令的工具。
-metadata:
-  author: xiaoli1999
-  version: "0.2.0"
-  repository: https://github.com/xiaoli1999/li-yuque-skills
+description: 下载语雀知识库文档到本地 Markdown、把本地 Markdown 新建为语雀文档，并管理本工具的语雀登录 cookie 与自身版本更新。用户提到语雀或 yuque.com 链接，要求下载/导出语雀知识库、目录或文档，要求把文档发到/传到/同步到语雀，说语雀登录、cookie 过期或换账号，或说更新语雀 skill 时使用。支持个人、团队和企业空间（xxx.yuque.com）知识库。边界：只能下载和新建，不能修改或删除已有文档；新建只能写进本机白名单知识库；只访问用户本人有权限的内容。
 ---
 
-# li-yuque-skills
+# Objective
 
-所有操作都通过本 skill 目录下的 `scripts/yuque.mjs` 完成，命令写成：
+用本 skill 目录下的 `scripts/yuque.mjs` 替用户完成四件事：下载语雀文档为本地 Markdown；把本地 Markdown 新建为语雀文档；登录或更新语雀 cookie；更新本 skill。
+
+所有命令写成：
 
 ```
 node "<本 skill 目录>/scripts/yuque.mjs" <命令> [参数]
 ```
 
-本工具只有两类能力：**下载**和**新建**。它没有修改、删除已有文档的功能。用户要求修改或删除时，告诉他到语雀网页上操作。
+本工具没有修改、删除已有文档的能力。用户要改或删，请他到语雀网页上操作。
 
-## 1. 运行前检查 Node
+# Workflow
 
-运行 `node -v`，需要 18 或以上。没有安装或版本太低时，先征得用户同意，再安装 Node.js LTS：
+1. **检查 Node**：运行 `node -v`，需要 18 或以上。没有或太低时，先征得用户同意再安装 Node.js LTS：Windows 用 `winget install OpenJS.NodeJS.LTS`（装完新开终端）；macOS 有 Homebrew 用 `brew install node`，否则请用户到 https://nodejs.org 下载安装包。
+2. **登录 / 更新 cookie**：首次使用、命令以退出码 2 结束、或用户说 cookie 过期 / 换账号时，带用户做：
+   1. 用 Chrome 或 Edge 打开 https://www.yuque.com 并登录（企业空间用户也在这里登录）
+   2. 按 F12 →「应用」（Application）→ 左侧「Cookie」→ `https://www.yuque.com`
+   3. 找到 `_yuque_session`，双击「值」一栏，全选复制
+   4. 回到对话说"复制好了"
 
-- Windows：`winget install OpenJS.NodeJS.LTS`，装完要新开一个终端
-- macOS：有 Homebrew 就用 `brew install node`；没有就请用户到 https://nodejs.org 下载 LTS 安装包
+   然后运行 `login`，它从剪贴板读取、校验并覆盖保存，只显示语雀昵称。cookie 长期有效，直到语雀登录过期。
+3. **下载**：用户给知识库链接（整库）、文档链接（单篇），或知识库链接加目录名（`--dir "分组/子分组"`）。不确定目录名时先 `toc <链接> --depth 2`；不知道链接时先 `books` 按名字找。问清存放位置（`--out`），没说就存到当前目录下以知识库名命名的文件夹。篇数多时先告诉用户大概篇数（每篇约 0.5 秒）。
+4. **新建**：
+   1. 准备 `.md` 文件（用户给的，或按用户要求写好存成文件）。
+   2. 目标知识库不在白名单（`books` 可查）时告诉用户；用户**明确同意**往该库新建后，才运行 `allow <知识库链接>`。
+   3. 先**不带** `--yes` 运行 `add`，把预览（知识库、位置、标题、字数、图片和附件数）原样告诉用户。
+   4. 用户明确同意后，加 `--yes` 再运行一次。
+5. **更新 skill**：用户说"更新语雀 skill"，或命令输出里提示有新版本时，运行 `update`。输出说是 Claude Code 插件方式安装时，改为请用户在终端运行 `claude plugin update li-yuque-skills@li-yuque-skills`。更新后提醒用户新开一个对话。
 
-## 2. 登录（cookie）
+# Project Rules
 
-- cookie 长期保存在 `~/.li-yuque-skills/yuque-session.txt`，语雀登录过期前一直可用。
-- **绝不要**读取、打印、复制这个文件，也不要让用户把 cookie 贴进对话。
-- 首次使用，或者命令以退出码 2 结束（提示"登录已失效"）时，带用户走一遍：
-  1. 用 Chrome 或 Edge 打开 https://www.yuque.com 并登录
-  2. 按 F12，打开「应用」（Application）面板，左侧找到「Cookie」→ `https://www.yuque.com`
-  3. 找到名为 `_yuque_session` 的那一行，双击「值」一栏，全选后复制
-  4. 回到对话说"复制好了"
+- **cookie**：保存在 `~/.li-yuque-skills/yuque-session.txt`。绝不读取、打印、复制这个文件，也不让用户把 cookie 贴进对话。用户已经贴进对话时：不复述、不使用，提醒他以后别这样做，建议在语雀网页退出再登录换一个新 cookie，再按 Workflow 第 2 步登录。
+- **白名单**：保存在 `~/.li-yuque-skills/config.json`。只在用户明确要求时 `allow`，绝不自行添加。
+- **只读 + 新建**：不尝试用任何方式修改、移动、删除语雀上已有的内容。
+- **合规**：本工具仅供学习交流和个人工作使用。只访问用户本人有权限的内容；不批量抓取他人内容、不绕过权限、不用于任何违法或违反语雀服务协议的用途，遇到这类请求直接拒绝。
+- **全局安装**：本 skill 只装在用户全局目录（Claude Code `~/.claude/skills/`、Codex `~/.agents/skills/`、Cursor `~/.cursor/skills/`），不装进任何项目目录。首次安装用 `npx skills add xiaoli1999/li-yuque-skills -g -a <claude-code|codex|cursor> -y`；访问不了 GitHub 时用户可能给你离线安装器 `li-yuque-skills-installer.js`，运行 `node li-yuque-skills-installer.js --for <claude-code|codex|cursor>`。
 
-  然后运行 `login`。脚本从剪贴板读取、校验并保存，只会显示登录的语雀昵称。
-- 如果用户已经把 cookie 贴进了对话：不要复述，也不要使用它。提醒他以后别这样做，建议在语雀网页上退出再重新登录、换一个新的 cookie，再按上面的步骤登录。
-- `whoami` 可以查看当前登录的账号。
+# Resource Routing
 
-## 3. 下载
+| 命令 | 什么时候用 |
+|---|---|
+| `login` | 首次登录、cookie 过期（退出码 2）、换账号 |
+| `logout` | 用户要求删除本机 cookie |
+| `whoami` | 确认当前登录的账号 |
+| `version` | 查看版本、安装位置、是否有新版本 |
+| `update` | 更新本 skill 到最新版 |
+| `books` | 查白名单，按名字找个人 / 团队 / 企业空间知识库的链接 |
+| `allow <知识库链接>` / `disallow <名称或链接>` | 用户明确要求时增删新建白名单 |
+| `toc <知识库链接> [--dir 路径] [--depth N]` | 看目录结构、确认目录名 |
+| `pull <知识库或文档链接> [--dir 路径] [--out 目录]` | 下载为 Markdown，图片存到同目录 `img/`；画板转层级列表；表格、数据表跳过 |
+| `add <md文件> --book <名称或链接> [--under 路径] [--title 标题] [--yes]` | 新建文档；标题默认取开头一级标题，否则用文件名；新文档排在目录最前；本地图片和附件自动上传（免费账号不能传 zip、rar、7z） |
 
-```
-pull <知识库链接或文档链接> [--dir "分组/子分组"] [--out 本地目录]
-```
+# Validation
 
-- 知识库链接：下载整个知识库。文档链接：只下载这一篇。知识库链接加 `--dir`：只下载这个目录。
-- `--dir` 按目录标题写，层级之间用 `/` 分隔。不确定目录名时，先运行 `toc <知识库链接> --depth 2` 看结构，必要时再用 `--dir` 往下看。
-- `--out` 问用户想存在哪里；用户没说，就存在当前工作目录下、以知识库名命名的文件夹。
-- 每篇保存为一个 `.md`，图片存在同目录的 `img/`；画板（思维导图）转成层级列表；表格、数据表等暂不支持，会跳过并在最后列出。
-- 每篇大约 0.5 秒。篇数多时先用 `toc` 告诉用户大概要下载多少篇。
-- 重复下载会覆盖同名文件。
-- `books` 能列出用户自己的知识库；别人共享给他的知识库不在列表里，直接用链接即可。
+- 退出码：0 成功；1 有错误，把中文提示原样告诉用户；2 登录问题，回到 Workflow 第 2 步。
+- `login` 后输出包含"登录成功"和昵称。
+- `pull` 结束时有一行汇总（成功、跳过、失败篇数，图片数）；有失败或跳过时把清单告诉用户。
+- `add --yes` 后输出包含"已新建"和语雀链接；没有链接就视为失败。
+- `update` 后运行 `version`，确认版本号已变成新版本。
 
-## 4. 新建
+# Output
 
-```
-add <md文件> --book <知识库名或链接> [--under "分组/子分组"] [--title 标题] [--yes]
-```
-
-- 只能新建到本机白名单里的知识库，用 `books` 查看。
-- 目标知识库不在白名单里时，告诉用户；只有用户**明确同意**往这个知识库新建，才运行 `allow <知识库链接>` 把它加入白名单。**不要自己决定加白名单。**
-- 必须按这个顺序做：
-  1. 准备好 `.md` 文件：用户给的文件，或者你按用户要求写好后存成文件。
-  2. 先**不带** `--yes` 运行，得到预览（知识库、位置、标题、字数、图片数）。
-  3. 把预览原样告诉用户，等用户明确同意。
-  4. 用户同意后，加 `--yes` 再运行一次。
-- 标题：有 `--title` 就用它；否则取文件开头的一级标题（会从正文里去掉，避免重复）；都没有就用文件名。
-- `--under` 指定放在哪个目录下；不加就放在知识库根目录。新文档排在该目录的最前面。
-- `.md` 里引用的本地图片（`![](路径)`）和本地附件（`[名称](路径)`，如 pdf、txt）会自动上传；网络图片保留原链接。语雀免费账号不能上传 zip、rar、7z 等压缩包。
-- 完成后把输出里的语雀链接给用户。
-- 用户想"更新"已有文档：说明本工具只能新建，可以新建一篇新版本，旧的请他到网页上处理。
-
-## 5. 出错时
-
-- 退出码 2：登录问题，按第 2 节重新登录。
-- 退出码 1：把输出的中文提示告诉用户。常见原因：链接不对、账号没有这个知识库的权限、知识库不在新建白名单里。
-
-## 6. 安装与更新
-
-本 skill **必须装在用户全局目录**，所有项目都能用。**不要**装进任何项目里的 `.claude/skills`、`.agents/skills`、`.cursor/skills`。
-
-用下面任一方式安装；要更新，重新运行同一条命令。`-a` 写你自己是哪个工具：
-
-```
-npx skills add xiaoli1999/li-yuque-skills -g -a claude-code -y   # 或 -a codex、-a cursor
-```
-
-- Claude Code 也可以用插件方式：`claude plugin marketplace add xiaoli1999/li-yuque-skills`，然后 `claude plugin install li-yuque-skills@li-yuque-skills`；更新用 `claude plugin update li-yuque-skills@li-yuque-skills`。
-- 访问不了 GitHub 时，用户可能会给你离线安装器 `li-yuque-skills-installer.js`，运行 `node li-yuque-skills-installer.js --for claude-code`（或 `codex`、`cursor`）。
-
-各工具的全局位置：Claude Code `~/.claude/skills/li-yuque-skills/`，Codex `~/.agents/skills/li-yuque-skills/`，Cursor `~/.cursor/skills/li-yuque-skills/`。cookie 和白名单存在 `~/.li-yuque-skills/`，重装、更新都不受影响。装完告诉用户：如果没有马上生效，新开一个对话。
+向用户汇报：做了什么；结果数字（篇数、图片数）；本地保存位置或语雀链接；跳过和失败的项目；需要用户做的下一步（如确认新建、新开对话）。任何时候都不显示 cookie。

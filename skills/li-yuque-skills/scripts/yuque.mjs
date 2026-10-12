@@ -11,8 +11,15 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
+// 更新来源：GitHub 原始文件优先，访问不了时用 jsDelivr 镜像（可能滞后几小时）
+const REPO = 'xiaoli1999/li-yuque-skills';
+const BRANCH = 'master';
+const REMOTE_FILES = { 'SKILL.md': 'skills/li-yuque-skills/SKILL.md', 'scripts/yuque.mjs': 'skills/li-yuque-skills/scripts/yuque.mjs' };
+const MIRRORS = [p => `https://raw.githubusercontent.com/${REPO}/${BRANCH}/${p}`, p => `https://cdn.jsdelivr.net/gh/${REPO}@${BRANCH}/${p}`];
+const SKILL_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 const HOME_DIR = path.join(os.homedir(), '.li-yuque-skills');
 const COOKIE_FILE = path.join(HOME_DIR, 'yuque-session.txt');
@@ -287,20 +294,24 @@ async function cmdWhoami() {
   console.log(`已登录：${me.name}（${me.login}）`);
 }
 
-// ---------- 新建白名单（本机配置） ----------
+// ---------- 本机配置（新建白名单、更新检查记录） ----------
+function readConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) || {}; } catch { return {}; }
+}
+
+function writeConfig(patch) {
+  const c = { ...readConfig(), ...patch };
+  fs.mkdirSync(HOME_DIR, { recursive: true });
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(c, null, 2) + '\n');
+}
+
 function readWhitelist() {
-  try {
-    const c = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-    return Array.isArray(c.addWhitelist) ? c.addWhitelist.filter(w => w && w.url) : [];
-  } catch { return []; }
+  const c = readConfig();
+  return Array.isArray(c.addWhitelist) ? c.addWhitelist.filter(w => w && w.url) : [];
 }
 
 function writeWhitelist(list) {
-  let c = {};
-  try { c = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { /* 新建 */ }
-  c.addWhitelist = list;
-  fs.mkdirSync(HOME_DIR, { recursive: true });
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(c, null, 2) + '\n');
+  writeConfig({ addWhitelist: list });
 }
 
 const sameBook = (url, book) => {
@@ -340,14 +351,35 @@ async function cmdBooks() {
   console.log('允许新建文档的知识库（本机白名单）：');
   if (!wl.length) console.log('  （空，需要时让用户明确同意后用 allow 添加）');
   for (const w of wl) console.log(`  - ${w.name}：${w.url}`);
-  const r = await yq('https://www.yuque.com/api/mine/books?limit=100&offset=0');
-  const list = (r.data || []).filter(b => String(b.type || 'Book') === 'Book');
-  console.log(`\n我的知识库（${list.length} 个，可下载）：`);
-  for (const b of list) {
-    const login = (b.user && b.user.login) || '';
-    console.log(`  - ${b.name}：https://www.yuque.com/${login}/${b.slug}（${b.items_count ?? '?'} 篇）`);
+  const isBook = b => String(b.type || 'Book') === 'Book' && b.slug;
+  const line = (host, login, b) => `  - ${b.name}：https://${host}/${(b.user && b.user.login) || login}/${b.slug}`;
+
+  const mine = ((await yq('https://www.yuque.com/api/mine/books?limit=100&offset=0')).data || []).filter(isBook);
+  console.log(`\n我的知识库（${mine.length} 个）：`);
+  for (const b of mine) console.log(line('www.yuque.com', '', b));
+
+  // 团队知识库：语雀主站的团队 + 各个企业空间（如 xxx.yuque.com）里的团队
+  const hosts = [{ host: 'www.yuque.com', label: '语雀' }];
+  for (const o of (await yq('https://www.yuque.com/api/mine/organizations')).data || []) {
+    try {
+      const h = new URL(o.host).hostname;
+      if (HOST_RE.test(h) && h !== 'www.yuque.com') hosts.push({ host: h, label: `${o.name}（${h}）` });
+    } catch { /* 跳过无效地址 */ }
   }
-  console.log('\n别人共享给你的知识库不在上面，直接用它的链接即可下载。');
+  for (const { host, label } of hosts) {
+    let groups = [];
+    try { groups = (await yq(`https://${host}/api/mine/groups`)).data || []; } catch (e) {
+      if (e instanceof LoginError) throw e;
+      console.log(`\n${label}：读取团队失败（${e.message}）`);
+      continue;
+    }
+    for (const g of groups) {
+      const books = ((await yq(`https://${host}/api/groups/${g.id}/books?offset=0&limit=200`)).data || []).filter(isBook);
+      console.log(`\n团队「${g.name}」· ${label}（${books.length} 个）：`);
+      for (const b of books) console.log(line(host, g.login, b));
+    }
+  }
+  console.log('\n以上都可以下载（只要账号有权限）；别人单独共享给你的知识库可能不在列表里，直接用链接即可。');
 }
 
 async function cmdToc(args) {
@@ -584,14 +616,105 @@ async function uploadFile(book, docId, abs, kind) {
   return u;
 }
 
+// ---------- 命令：logout ----------
+async function cmdLogout() {
+  if (!fs.existsSync(COOKIE_FILE)) { console.log('本机没有保存 cookie。'); return; }
+  fs.rmSync(COOKIE_FILE, { force: true });
+  console.log(`已删除本机保存的 cookie：${COOKIE_FILE}。白名单保留。`);
+}
+
+// ---------- 命令：version / update（从 GitHub 更新 skill 自身） ----------
+const cmpVer = (a, b) => {
+  const x = String(a).split('.').map(Number), y = String(b).split('.').map(Number);
+  for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0);
+  return 0;
+};
+const versionOf = src => (/const VERSION = '([^']+)'/.exec(src) || [])[1] || null;
+
+// 按镜像顺序下载一个仓库文件；不带 cookie
+async function fetchRemote(p, timeout) {
+  let last;
+  for (const m of MIRRORS) {
+    try {
+      const res = await fetch(m(p), { headers: { 'user-agent': UA }, signal: AbortSignal.timeout(timeout) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.text();
+    } catch (e) { last = e; }
+  }
+  throw new Error(`访问 GitHub 和镜像都失败（${last && last.message}）`);
+}
+
+const isPluginInstall = () => /[\\/]plugins[\\/]/.test(SKILL_ROOT);
+
+async function cmdVersion() {
+  console.log(`li-yuque-skills 当前版本 ${VERSION}`);
+  console.log(`安装位置：${SKILL_ROOT}${isPluginInstall() ? '（Claude Code 插件方式安装）' : ''}`);
+  try {
+    const latest = versionOf(await fetchRemote(REMOTE_FILES['scripts/yuque.mjs'], 10000));
+    writeConfig({ updateCheck: { at: Date.now(), latest } });
+    console.log(latest && cmpVer(latest, VERSION) > 0 ? `最新版本 ${latest}，可以更新。` : `已是最新版本（GitHub 上为 ${latest}）。`);
+  } catch (e) {
+    console.log(`检查新版本失败：${e.message}`);
+  }
+}
+
+async function cmdUpdate() {
+  if (isPluginInstall()) {
+    console.log('这是 Claude Code 插件方式安装的，请在终端运行：\n  claude plugin update li-yuque-skills@li-yuque-skills');
+    return;
+  }
+  const skillMd = path.join(SKILL_ROOT, 'SKILL.md');
+  if (!fs.existsSync(skillMd) || !/^name:\s*li-yuque-skills\s*$/m.test(fs.readFileSync(skillMd, 'utf8'))) {
+    throw new UserError(`没在 ${SKILL_ROOT} 找到 li-yuque-skills 的 SKILL.md，无法自动更新。`);
+  }
+  const got = {};
+  for (const [rel, p] of Object.entries(REMOTE_FILES)) got[rel] = await fetchRemote(p, 30000);
+  const latest = versionOf(got['scripts/yuque.mjs']);
+  if (!latest || !/^---\r?\nname:\s*li-yuque-skills/.test(got['SKILL.md'])) throw new UserError('下载到的文件不完整，已放弃更新。');
+  if (cmpVer(latest, VERSION) <= 0) {
+    writeConfig({ updateCheck: { at: Date.now(), latest } });
+    console.log(`已是最新版本 ${VERSION}。`);
+    return;
+  }
+  // 新脚本先过语法检查，再逐个原子替换
+  const tmp = path.join(os.tmpdir(), `li-yuque-skills-${process.pid}.mjs`);
+  fs.writeFileSync(tmp, got['scripts/yuque.mjs']);
+  try { execFileSync(process.execPath, ['--check', tmp], { stdio: 'ignore' }); } catch { throw new UserError('下载到的新脚本校验失败，已放弃更新。'); } finally { fs.rmSync(tmp, { force: true }); }
+  for (const [rel, text] of Object.entries(got)) {
+    const dest = path.join(SKILL_ROOT, rel);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest + '.new', text);
+    fs.renameSync(dest + '.new', dest);
+  }
+  writeConfig({ updateCheck: { at: Date.now(), latest } });
+  console.log(`已从 ${VERSION} 更新到 ${latest}：${SKILL_ROOT}`);
+  console.log('新开一个对话后生效。cookie 和白名单不受影响。');
+}
+
+// 每天最多查一次新版本，有就在命令末尾提醒一句；失败不打扰
+async function notifyUpdate() {
+  try {
+    const c = readConfig().updateCheck || {};
+    let latest = c.latest;
+    if (!c.at || Date.now() - c.at > 24 * 3600e3) {
+      latest = versionOf(await fetchRemote(REMOTE_FILES['scripts/yuque.mjs'], 4000));
+      writeConfig({ updateCheck: { at: Date.now(), latest } });
+    }
+    if (latest && cmpVer(latest, VERSION) > 0) console.log(`\n提示：li-yuque-skills 有新版本 ${latest}（当前 ${VERSION}），对 AI 说「更新语雀 skill」即可更新。`);
+  } catch { /* 网络不通就下次再查 */ }
+}
+
 // ---------- 入口 ----------
 const HELP = `li-yuque-skills ${VERSION}：语雀知识库下载 / 新建文档
 
 用法：node yuque.mjs <命令> [参数]
 
-  login                       从剪贴板读取 cookie，校验后保存（不会显示 cookie）
+  login                       首次登录或更新 cookie：从剪贴板读取，校验后保存（不会显示 cookie）
+  logout                      删除本机保存的 cookie
   whoami                      查看当前登录的语雀账号
-  books                       列出新建白名单和我的知识库
+  version                     查看当前版本、安装位置，并检查新版本
+  update                      从 GitHub 更新本 skill 到最新版
+  books                       列出新建白名单、我的知识库和团队/空间知识库
   allow <知识库链接>           把知识库加入本机新建白名单（须用户明确同意）
   disallow <知识库名或链接>     从本机新建白名单移除
   toc  <知识库链接> [--dir 目录/子目录] [--depth 层数]
@@ -609,9 +732,13 @@ async function main() {
   if (major < 18) throw new UserError(`Node 版本太低（${process.versions.node}），需要 18 或以上。`);
   const args = parseArgs(process.argv.slice(2));
   const cmd = args._[0];
-  const table = { login: cmdLogin, whoami: cmdWhoami, books: cmdBooks, allow: cmdAllow, disallow: cmdDisallow, toc: cmdToc, pull: cmdPull, add: cmdAdd };
+  const table = {
+    login: cmdLogin, logout: cmdLogout, whoami: cmdWhoami, version: cmdVersion, update: cmdUpdate,
+    books: cmdBooks, allow: cmdAllow, disallow: cmdDisallow, toc: cmdToc, pull: cmdPull, add: cmdAdd,
+  };
   if (!cmd || args.help || !table[cmd]) { console.log(HELP); return; }
   await table[cmd](args);
+  if (!['version', 'update', 'logout'].includes(cmd)) await notifyUpdate();
 }
 
 main().catch(e => {

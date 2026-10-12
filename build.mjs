@@ -29,9 +29,11 @@ const desc = (/^description:\s*(.+)$/m.exec(fm) || [])[1] || '';
 if (name !== NAME) fail(`SKILL.md 的 name（${name}）必须与目录名 ${NAME} 一致`);
 if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(name) || name.length > 64) fail('name 只能是小写字母、数字和单个连字符，最长 64');
 if (!desc || desc.length > 1024) fail('description 必填且不超过 1024 字符');
+// 团队规范：frontmatter 只允许 name 和 description
+const keys = fm.split(/\r?\n/).filter(l => /^[A-Za-z_-]+:/.test(l)).map(l => l.split(':')[0]);
+if (keys.join(',') !== 'name,description') fail(`SKILL.md frontmatter 只能有 name 和 description，现在是：${keys.join(', ')}`);
 const version = /const VERSION = '([^']+)'/.exec(script)[1];
-const mdVersion = (/^\s+version:\s*"?([^"\s]+)"?$/m.exec(fm) || [])[1];
-if (version !== mdVersion || version !== plugin.version) fail(`版本号不一致：yuque.mjs ${version}，SKILL.md ${mdVersion}，plugin.json ${plugin.version}`);
+if (version !== plugin.version) fail(`版本号不一致：yuque.mjs ${version}，plugin.json ${plugin.version}`);
 for (const [f, s] of [['SKILL.md', skillMd], ['plugin.json', JSON.stringify(plugin)], ['README.md', fs.readFileSync(path.join(root, 'README.md'), 'utf8')]]) {
   if (s.includes('{{OWNER}}')) fail(`${f} 里还有 {{OWNER}} 占位符没替换`);
 }
@@ -90,7 +92,14 @@ execFileSync(process.execPath, ['--check', path.join(dist, INSTALLER)], { stdio:
 let local = {};
 try { local = JSON.parse(fs.readFileSync(path.join(root, 'guide.local.json'), 'utf8')); } catch { /* 没有就留占位 */ }
 const repoUrl = `https://github.com/${owner}/${NAME}`;
+// CHANGELOG 嵌进指南：去掉总标题，版本标题降一级
+const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8')
+  .replace(/^# .*\r?\n+/, '').replace(/^## /gm, '### ').trim();
+const today = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
+if (!changelog.includes(`v${version} `)) fail(`CHANGELOG.md 里还没有 v${version} 的记录`);
 const guide = fs.readFileSync(path.join(root, 'docs', '使用指南.md'), 'utf8')
+  .replaceAll('{{CHANGELOG}}', changelog)
+  .replaceAll('{{DATE}}', today)
   .replaceAll('{{OWNER}}', owner)
   .replaceAll('{{REPO_URL}}', repoUrl)
   .replaceAll('{{ZIP_URL}}', `${repoUrl}/archive/refs/heads/master.zip`)
