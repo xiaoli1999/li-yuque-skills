@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-// li-yuque-skills：下载语雀知识库文档到本地、把本地 Markdown 新建到语雀。零依赖，需要 Node 18 及以上。
+// li-yuque-skills：读取、搜索、下载语雀文档，新建、修改文档，删除自己创建的文档。零依赖，需要 Node 18 及以上。
 // 安全约定：
-//   1. 只有「读取」和「新建」两类能力，没有修改、删除已有文档的代码。
-//   2. 新建必须先预览、用户确认后带 --yes 才写入；访问范围只受账号自身权限约束。
-//   3. cookie 只从 ~/.li-yuque-skills/yuque-session.txt 读取，只发往 yuque.com，任何时候都不打印。
+//   1. 写操作只有新建、修改、删除三种；删除只允许删本人创建、且没有子文档的文档。
+//   2. 写操作都先预览，用户确认后带 --yes 才执行；访问范围只受账号自身权限约束。
+//   3. cookie 只从 ~/.li-yuque-skills/yuque-session.txt 读取，只发往 yuque.com，任何时候都不打印；
+//      语雀续期时如果换了新值，校验能登录后才覆盖保存。
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -12,11 +13,11 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.6.0';
+const VERSION = '0.7.0';
 // 更新来源：GitHub 原始文件优先，访问不了时用 jsDelivr 镜像（可能滞后几小时）
 const REPO = 'xiaoli1999/li-yuque-skills';
 const BRANCH = 'master';
-const REMOTE_FILES = { 'SKILL.md': 'skills/li-yuque-skills/SKILL.md', 'scripts/yuque.mjs': 'skills/li-yuque-skills/scripts/yuque.mjs' };
+const REMOTE_FILES = { 'SKILL.md': 'skills/li-yuque-skills/SKILL.md', 'scripts/yuque.mjs': 'skills/li-yuque-skills/scripts/yuque.mjs', changelog: 'CHANGELOG.md' };
 const MIRRORS = [p => `https://raw.githubusercontent.com/${REPO}/${BRANCH}/${p}`, p => `https://cdn.jsdelivr.net/gh/${REPO}@${BRANCH}/${p}`];
 const SKILL_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
@@ -129,6 +130,7 @@ async function yq(url, { method = 'GET', json, body, session } = {}) {
     throw new UserError(`语雀返回跳转（${res.status}），链接可能不对：${u.pathname}`);
   }
   if (res.status === 401) throw new LoginError('语雀登录已失效。');
+  if (!session) noteSessionCookie(res, token);
   text = await res.text();
   if (isThrottled(res.status, text)) throw new UserError('语雀提示访问过于频繁，已停止。请至少过 1 小时再试，期间不要重复运行或同时开多个任务。');
   if (!isApi) {
@@ -147,6 +149,30 @@ async function yq(url, { method = 'GET', json, body, session } = {}) {
     throw e;
   }
   return data;
+}
+
+// 语雀每次续期都会重发 _yuque_session（实测有效期 30 天，值不变）。万一续期时换了新值，先记下来，
+// 命令结束时用新值校验能登录后再覆盖保存（saveRenewedSession），这样同事不用手动更新 cookie。
+let renewedSession = null;
+function noteSessionCookie(res, used) {
+  const list = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [res.headers.get('set-cookie') || ''];
+  for (const c of list) {
+    const m = /(?:^|[\s,])_yuque_session=([^;,\s]+)/.exec(c);
+    if (!m || /max-age=0\b|expires=Thu, 01 Jan 1970/i.test(c)) continue;
+    if (m[1] !== used && extractSession(m[1])) renewedSession = m[1];
+  }
+}
+
+async function saveRenewedSession() {
+  const s = renewedSession;
+  renewedSession = null;
+  if (!s) return;
+  try {
+    await whoami(s); // 新值能登录才保存，防止把未登录的会话写进去
+    fs.writeFileSync(COOKIE_FILE + '.new', s + '\n', { mode: 0o600 });
+    fs.renameSync(COOKIE_FILE + '.new', COOKIE_FILE);
+    console.log('\n语雀续期时换了新的 cookie，已自动保存，无需操作。');
+  } catch { /* 新值不能用就保留原来的 */ }
 }
 
 function getAppData(html) {
@@ -624,18 +650,12 @@ async function cmdAdd(args) {
   if (h1 && h1[1].trim() === title) md = md.slice(h1[0].length);
 
   const locals = scanLocalFiles(md, path.dirname(abs));
-  const imgs = locals.filter(f => f.kind === 'image');
-  const atts = locals.filter(f => f.kind === 'attachment');
-  const missing = locals.filter(f => !f.exists);
 
   console.log('新建预览：');
   console.log(`  知识库：${book.name}  ${book.url}`);
   console.log(`  位置：${parent ? `${args.under}（排在最前）` : '根目录（排在最前）'}`);
   console.log(`  标题：${title}`);
-  console.log(`  正文：${md.trim().length} 字符；本地图片 ${imgs.length} 张，本地附件 ${atts.length} 个`);
-  if (missing.length) console.log(`  找不到的本地文件（会保留原样）：${missing.map(f => f.ref).join('、')}`);
-  const risky = locals.filter(f => f.exists && f.kind === 'attachment' && RISKY_EXT.test(f.abs));
-  if (risky.length) console.log(`  注意：语雀免费账号不能上传压缩包等类型，这些附件可能失败：${risky.map(f => f.ref).join('、')}`);
+  printLocals(md, locals);
   if (!args.yes) {
     console.log('\n这是预览，还没有写入。请把预览给用户看，用户明确确认后加 --yes 再运行一次。');
     return;
@@ -655,24 +675,147 @@ async function cmdAdd(args) {
   if (!doc.id || !doc.slug) throw new UserError('语雀没有返回新文档信息，请到网页上确认是否已创建。');
   const docUrl = `${book.url}/${doc.slug}`;
 
+  let synced = true;
   if (uploads.length) {
     try {
-      const done = new Map();
-      for (const f of uploads) {
-        if (!done.has(f.abs)) done.set(f.abs, await uploadFile(book, doc.id, f.abs, f.kind));
-        f.url = done.get(f.abs);
-      }
-      for (const f of uploads) md = md.split(`](${f.ref}`).join(`](${f.url}`);
+      md = await uploadLocals(book, doc.id, md, uploads);
       // 只改本次刚建的这篇
-      await yq(`https://${book.host}/api/docs/${doc.id}`, {
-        method: 'PUT',
-        json: { id: doc.id, body: md, format: 'markdown', status: 1, save_type: 'user' },
-      });
+      synced = await saveDoc(book, doc.slug, doc.id, title, md, true, docUrl);
     } catch (e) {
       throw new UserError(`文档已建成草稿，但上传本地文件或发布时出错：${e.message}\n草稿地址：${docUrl}（可到网页上处理）`);
     }
   }
   console.log(`\n已新建：${title}\n链接：${docUrl}`);
+  if (!synced) console.log(DRAFT_NOT_SYNCED);
+}
+
+// 预览里说明正文长度和本地图片、附件
+function printLocals(md, locals) {
+  const imgs = locals.filter(f => f.kind === 'image');
+  const atts = locals.filter(f => f.kind === 'attachment');
+  const missing = locals.filter(f => !f.exists);
+  console.log(`  正文：${md.trim().length} 字符；本地图片 ${imgs.length} 张，本地附件 ${atts.length} 个`);
+  if (missing.length) console.log(`  找不到的本地文件（会保留原样）：${missing.map(f => f.ref).join('、')}`);
+  const risky = locals.filter(f => f.exists && f.kind === 'attachment' && RISKY_EXT.test(f.abs));
+  if (risky.length) console.log(`  注意：语雀免费账号不能上传压缩包等类型，这些附件可能失败：${risky.map(f => f.ref).join('、')}`);
+}
+
+// 把本地文件上传到这篇文档名下，并把正文里的本地路径换成语雀地址
+async function uploadLocals(book, docId, md, uploads) {
+  const done = new Map();
+  for (const f of uploads) {
+    if (!done.has(f.abs)) done.set(f.abs, await uploadFile(book, docId, f.abs, f.kind));
+    f.url = done.get(f.abs);
+  }
+  for (const f of uploads) md = md.split(`](${f.ref}`).join(`](${f.url}`);
+  return md;
+}
+
+// 按文档链接取知识库和文档详情（修改、删除只认单篇文档的链接）
+async function loadDocByLink(link) {
+  if (!/^https?:\/\//i.test(String(link))) throw new UserError(`需要文档链接（https://...yuque.com/...），收到：${link}。不知道链接时先用 search 找。`);
+  const book = await loadBook(link);
+  if (!book.docSlug) throw new UserError(`这是知识库链接，不是单篇文档的链接：${link}`);
+  const r = await yq(`https://${book.host}/api/docs/${encodeURIComponent(book.docSlug)}?book_id=${book.id}&merge_dynamic_data=false`);
+  const doc = r.data || {};
+  if (!doc.id) throw new UserError(`打不开这篇文档：${link}`);
+  if (String(doc.type || '').toLowerCase() !== 'doc') throw new UserError(`「${doc.title}」是${doc.type || '未知'}类型，只支持普通文档。`);
+  return { book, doc, url: `${book.url}/${book.docSlug}`, abilities: doc.abilities || {} };
+}
+
+// ---------- 命令：edit（用本地 Markdown 替换已有文档的全文） ----------
+// read / pull 输出里的说明行：「> 知识库：… · 更新：… · 原文：<链接>」或「> 更新：… · 原文：<链接>」
+const META_RE = /^>\s*(?:知识库：.*?·\s*)?更新：\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2})?\s*·\s*原文：<(https:\/\/[^>\s]+)>[ \t]*\r?$/gm;
+
+async function cmdEdit(args) {
+  const [, link, file] = args._;
+  if (!link || !file) throw new UserError('用法：edit <文档链接> <md文件> [--title 标题] [--yes]');
+  const abs = path.resolve(file);
+  if (!fs.existsSync(abs)) throw new UserError(`文件不存在：${abs}`);
+  const { book, doc, url, abilities } = await loadDocByLink(link);
+  if (!abilities.update) throw new UserError(`没有「${doc.title}」的编辑权限：${url}`);
+
+  // 去掉 read / pull 加的说明行；其中的「更新」时间是修改的底稿时间，用来发现别人后来又改过
+  let md = fs.readFileSync(abs, 'utf8').replace(/^﻿/, '');
+  const base = [...md.matchAll(META_RE)].find(m => m[1] && m[2].split(/[?#]/)[0].endsWith(`/${book.docSlug}`));
+  md = md.replace(META_RE, '');
+  const h1 = /^\s*#\s+(.+?)\s*#*\s*(\r?\n|$)/.exec(md);
+  const title = String(args.title || (h1 && h1[1]) || doc.title).trim();
+  if (h1 && h1[1].trim() === title) md = md.slice(h1[0].length);
+  md = md.trim() + '\n';
+  if (!md.trim()) throw new UserError('文件里没有正文，不能把文档改成空白。');
+  const locals = scanLocalFiles(md, path.dirname(abs));
+  const remoteAt = bj(doc.content_updated_at || doc.updated_at);
+  const editor = doc.last_editor && doc.last_editor.name;
+
+  console.log('修改预览：');
+  console.log(`  文档：${doc.title}  ${url}`);
+  console.log(`  知识库：${book.name}`);
+  console.log(`  语雀上最后修改：${remoteAt}${editor ? `（${editor.trim()}）` : ''}${doc.status === 0 ? '；这篇目前是草稿，改完仍是草稿' : ''}`);
+  console.log(`  标题：${title === doc.title ? '不变' : `「${doc.title}」→「${title}」`}`);
+  console.log(`  语雀上现在约 ${doc.word_count || 0} 字，会被下面的新内容整篇替换`);
+  printLocals(md, locals);
+  if (base && base[1] < remoteAt) console.log(`  ⚠ 你的底稿是 ${base[1]} 的版本，之后语雀上又被改过（${remoteAt}）。直接覆盖会丢掉这些改动，建议先重新读取最新内容再改。`);
+  console.log('  提醒：Markdown 表达不了的样式（字体颜色、卡片、合并单元格等）会丢失；语雀保留历史版本，改错了可以在文档的「历史版本」里恢复。');
+  if (!args.yes) {
+    console.log('\n这是预览，还没有写入。请把预览给用户看，用户明确确认后加 --yes 再运行一次。');
+    return;
+  }
+
+  const uploads = locals.filter(f => f.exists);
+  if (uploads.length) md = await uploadLocals(book, doc.id, md, uploads);
+  const synced = await saveDoc(book, book.docSlug, doc.id, title, md, doc.status !== 0, url);
+  console.log(`\n已修改：${title}\n链接：${url}`);
+  if (!synced) console.log(DRAFT_NOT_SYNCED);
+}
+
+// 按网页编辑器的顺序保存正文：先以编辑模式打开（不这样做，存草稿会被忽略），再存草稿（同时更新编辑器草稿），需要时再发布。
+// 只改发布内容时，网页编辑器会载入旧草稿，下次保存会把旧内容发布回去。返回编辑器草稿是否已是新内容。
+async function saveDoc(book, slug, id, title, md, publish, url) {
+  const editUrl = `https://${book.host}/api/docs/${encodeURIComponent(slug)}?book_id=${book.id}&merge_dynamic_data=false&mode=edit`;
+  const put = status => yq(`https://${book.host}/api/docs/${id}`, {
+    method: 'PUT',
+    json: { id, title, body: md, ...(status === 0 ? { body_draft: md } : {}), format: 'markdown', status, save_type: 'user' },
+  });
+  await yq(editUrl);
+  await put(0);
+  if (publish) {
+    try { await put(1); } catch (e) {
+      throw new UserError(`新内容已存为草稿，但发布时出错：${e.message}\n请到网页上打开这篇点「发布」：${url}`);
+    }
+  }
+  const draft = ((await yq(editUrl)).data || {}).body_draft;
+  return String(draft || '').trim() === md.trim();
+}
+const DRAFT_NOT_SYNCED = '注意：已发布，但网页编辑器里的草稿没有同步。之后在网页上编辑这篇前，请先确认编辑器里是新内容。';
+
+// ---------- 命令：delete（只删自己创建、且没有子文档的文档） ----------
+async function cmdDelete(args) {
+  const link = args._[1];
+  if (!link || args._.length > 2) throw new UserError('用法：delete <文档链接> [--yes]（一次只能删一篇）');
+  const { book, doc, url, abilities } = await loadDocByLink(link);
+  const me = await whoami();
+  const owner = (doc.user && doc.user.name || '').trim() || '别人';
+  if (doc.user_id !== me.id) throw new UserError(`只能删除自己创建的文档。「${doc.title}」是${owner}创建的，确需删除请联系作者，或到语雀网页上操作。`);
+  if (!abilities.destroy) throw new UserError(`没有「${doc.title}」的删除权限：${url}`);
+  const node = book.toc.find(t => t.url === book.docSlug);
+  const kids = node ? book.toc.filter(t => t.parent_uuid === node.uuid) : [];
+  if (kids.length) throw new UserError(`「${doc.title}」下面还有 ${kids.length} 篇子文档，为避免误删，不删除带子文档的文档。请先移走子文档，或到语雀网页上操作。`);
+  const editor = doc.last_editor || {};
+
+  console.log('删除预览：');
+  console.log(`  文档：${doc.title}  ${url}`);
+  console.log(`  知识库：${book.name}`);
+  console.log(`  创建：${bj(doc.created_at)}（${String(me.name || '').trim()}，本人）；最后修改：${bj(doc.content_updated_at || doc.updated_at)}（${(editor.name || '').trim() || '未知'}）`);
+  console.log(`  正文约 ${doc.word_count || 0} 字`);
+  if (editor.id && editor.id !== me.id) console.log('  注意：最后修改人不是你，删除会连同他人的修改一起删掉。');
+  console.log('  删除后进入知识库的「回收站」，可以在语雀网页上恢复。');
+  if (!args.yes) {
+    console.log('\n这是预览，还没有删除。请把预览给用户看，用户明确确认要删除后加 --yes 再运行一次。');
+    return;
+  }
+  await yq(`https://${book.host}/api/docs/${doc.id}`, { method: 'DELETE' });
+  console.log(`\n已删除：${doc.title}\n已进入「${book.name}」的回收站，需要时可在语雀网页上恢复。`);
 }
 
 // 语雀前端代码里 .zip/.rar/.7z 只对付费账号开放，其余压缩包和 .mjs 也会被拒（2026-10-12 实测）
@@ -729,20 +872,18 @@ const SAY_EXAMPLES = `你可以这样对 AI 说：
   · 把这篇文档下载下来：<文档链接>
   · 把 D:\\文档\\周报.md 发到语雀「某某知识库」的「某目录」下
   · 帮我把刚才的内容整理成文档，发到语雀「某某知识库」
+  · 把这篇文档里的「旧说法」改成「新说法」：<文档链接>
+  · 删除我建的这篇文档：<文档链接>（只能删自己创建的）
   · 更新语雀 skill ／ 更新语雀 cookie，已复制 ／ 删除语雀 cookie`;
 
 async function cmdGuide() {
+  // 本机从没用过（刚安装）：先说清楚只需要做一次的事
+  const firstRun = !fs.existsSync(CONFIG_FILE) && !fs.existsSync(COOKIE_FILE);
   console.log(`li-yuque-skills v${VERSION} · 使用引导\n`);
+  if (firstRun) console.log('欢迎使用！刚装好只需要做一次「登录」，之后一直能用；skill 每天第一次使用时会自动更新，不用管。\n');
   const todo = [];
 
-  let latest = null;
-  try {
-    latest = (await fetchLatest(6000)).version;
-    writeConfig({ updateCheck: { at: Date.now(), latest } });
-  } catch { /* 网络不通不影响引导 */ }
-  const outdated = latest && cmpVer(latest, VERSION) > 0;
-  console.log(`① 安装：v${VERSION}，Node ${process.versions.node}${outdated ? `；有新版本 v${latest}` : latest ? '；已是最新' : ''}`);
-  if (outdated) todo.push('对 AI 说「更新语雀 skill」，更新到最新版');
+  console.log(`① 安装：v${VERSION}，Node ${process.versions.node}；每天第一次使用时自动检查并更新`);
 
   let me = null, state = '未登录';
   if (fs.existsSync(COOKIE_FILE)) {
@@ -754,14 +895,16 @@ async function cmdGuide() {
     }
   }
   console.log(`② 登录：${state}`);
-  if (!me) todo.push(LOGIN_STEPS);
+  if (!me) {
+    todo.push(LOGIN_STEPS);
+    todo.push('登录好后试一下：发一个语雀文档链接给 AI，问「这篇讲了什么」');
+  }
 
-
-  console.log('\n下一步：');
+  console.log('\n下一步（请 AI 一步一步带用户做，做完一步再说下一步）：');
   if (!todo.length) console.log('  一切就绪，可以直接用了。');
   todo.forEach((t, i) => console.log(`  ${i + 1}. ${t}`));
   console.log(`\n${SAY_EXAMPLES}`);
-  console.log('\n提醒：新建前会先给你看预览，你确认后才发布；不要短时间内反复下载整个知识库，以免触发语雀的访问频率限制。');
+  console.log('\n提醒：新建、修改、删除前都会先给你看预览，你确认后才执行；不要短时间内反复下载整个知识库，以免触发语雀的访问频率限制。');
 }
 
 // ---------- 命令：logout ----------
@@ -798,15 +941,67 @@ async function fetchLatest(timeout) {
   return best;
 }
 
-const isPluginInstall = () => /[\\/]plugins[\\/]/.test(SKILL_ROOT);
+// 查最新版本并记下来（不改 day，不影响当天的自动更新）
+async function checkLatest(timeout) {
+  const best = await fetchLatest(timeout);
+  writeConfig({ updateCheck: { ...(readConfig().updateCheck || {}), at: Date.now(), latest: best.version } });
+  return best;
+}
+
+const isPluginInstall = () => /[\/]plugins[\/]/.test(SKILL_ROOT);
+
+// 从 CHANGELOG 摘出 (from, to] 之间各版本的要点，每条只取第一句
+function changesBetween(changelog, from, to) {
+  const out = [];
+  for (const sec of String(changelog).split(/^## /m).slice(1)) {
+    const v = (/^v(\d+\.\d+\.\d+)/.exec(sec) || [])[1];
+    if (!v || cmpVer(v, from) <= 0 || cmpVer(v, to) > 0) continue;
+    for (const line of sec.split(/\r?\n/)) {
+      const m = /^- (.+)/.exec(line);
+      if (m) out.push(`  · ${m[1].split('。')[0]}`);
+    }
+  }
+  return out;
+}
+
+// 下载并替换 SKILL.md 和脚本，返回这次更新的要点
+async function installUpdate(best, timeout) {
+  const skillMd = path.join(SKILL_ROOT, 'SKILL.md');
+  if (!fs.existsSync(skillMd) || !/^name:\s*li-yuque-skills\s*$/m.test(fs.readFileSync(skillMd, 'utf8'))) {
+    throw new UserError(`没在 ${SKILL_ROOT} 找到 li-yuque-skills 的 SKILL.md，无法自动更新。`);
+  }
+  // SKILL.md 和脚本取自同一个来源，保证是同一版本
+  const got = { 'SKILL.md': await fetchFrom(best.mirror, REMOTE_FILES['SKILL.md'], timeout), 'scripts/yuque.mjs': best.script };
+  if (!/^---\r?\nname:\s*li-yuque-skills/.test(got['SKILL.md'])) throw new UserError('下载到的文件不完整，已放弃更新。');
+  // 新脚本先过语法检查，再逐个原子替换
+  const tmp = path.join(os.tmpdir(), `li-yuque-skills-${process.pid}.mjs`);
+  fs.writeFileSync(tmp, got['scripts/yuque.mjs']);
+  try { execFileSync(process.execPath, ['--check', tmp], { stdio: 'ignore' }); } catch { throw new UserError('下载到的新脚本校验失败，已放弃更新。'); } finally { fs.rmSync(tmp, { force: true }); }
+  for (const [rel, text] of Object.entries(got)) {
+    const dest = path.join(SKILL_ROOT, rel);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(`${dest}.new-${process.pid}`, text);
+    fs.renameSync(`${dest}.new-${process.pid}`, dest);
+  }
+  try {
+    return changesBetween(await fetchFrom(best.mirror, REMOTE_FILES.changelog, timeout), VERSION, best.version);
+  } catch {
+    return []; // 拿不到更新说明不影响更新
+  }
+}
+
+function printUpdated(to, notes, auto) {
+  console.log(`\n${auto ? '已自动' : '已'}把 li-yuque-skills 从 ${VERSION} 更新到 ${to}${auto ? '（每天第一次使用时检查）' : ''}。`);
+  if (notes.length) console.log(`这次更新了：\n${notes.join('\n')}`);
+  console.log('下一条命令起使用新版；使用说明有变化时，新开对话后生效。cookie 不受影响。');
+}
 
 async function cmdVersion() {
   console.log(`li-yuque-skills 当前版本 ${VERSION}`);
   console.log(`安装位置：${SKILL_ROOT}${isPluginInstall() ? '（Claude Code 插件方式安装）' : ''}`);
   try {
-    const latest = (await fetchLatest(10000)).version;
-    writeConfig({ updateCheck: { at: Date.now(), latest } });
-    console.log(latest && cmpVer(latest, VERSION) > 0 ? `最新版本 ${latest}，可以更新。` : `已是最新版本（GitHub 上为 ${latest}）。`);
+    const latest = (await checkLatest(10000)).version;
+    console.log(cmpVer(latest, VERSION) > 0 ? `最新版本 ${latest}，可以更新。` : `已是最新版本（GitHub 上为 ${latest}）。`);
   } catch (e) {
     console.log(`检查新版本失败：${e.message}`);
   }
@@ -817,50 +1012,43 @@ async function cmdUpdate() {
     console.log('这是 Claude Code 插件方式安装的，请在终端运行：\n  claude plugin update li-yuque-skills@li-yuque-skills');
     return;
   }
-  const skillMd = path.join(SKILL_ROOT, 'SKILL.md');
-  if (!fs.existsSync(skillMd) || !/^name:\s*li-yuque-skills\s*$/m.test(fs.readFileSync(skillMd, 'utf8'))) {
-    throw new UserError(`没在 ${SKILL_ROOT} 找到 li-yuque-skills 的 SKILL.md，无法自动更新。`);
-  }
-  // SKILL.md 和脚本取自同一个来源，保证是同一版本
-  const best = await fetchLatest(30000);
-  const got = { 'SKILL.md': await fetchFrom(best.mirror, REMOTE_FILES['SKILL.md'], 30000), 'scripts/yuque.mjs': best.script };
-  const latest = best.version;
-  if (!latest || !/^---\r?\nname:\s*li-yuque-skills/.test(got['SKILL.md'])) throw new UserError('下载到的文件不完整，已放弃更新。');
-  if (cmpVer(latest, VERSION) <= 0) {
-    writeConfig({ updateCheck: { at: Date.now(), latest } });
+  const best = await checkLatest(30000);
+  if (cmpVer(best.version, VERSION) <= 0) {
     console.log(`已是最新版本 ${VERSION}。`);
     return;
   }
-  // 新脚本先过语法检查，再逐个原子替换
-  const tmp = path.join(os.tmpdir(), `li-yuque-skills-${process.pid}.mjs`);
-  fs.writeFileSync(tmp, got['scripts/yuque.mjs']);
-  try { execFileSync(process.execPath, ['--check', tmp], { stdio: 'ignore' }); } catch { throw new UserError('下载到的新脚本校验失败，已放弃更新。'); } finally { fs.rmSync(tmp, { force: true }); }
-  for (const [rel, text] of Object.entries(got)) {
-    const dest = path.join(SKILL_ROOT, rel);
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    fs.writeFileSync(dest + '.new', text);
-    fs.renameSync(dest + '.new', dest);
-  }
-  writeConfig({ updateCheck: { at: Date.now(), latest } });
-  console.log(`已从 ${VERSION} 更新到 ${latest}：${SKILL_ROOT}`);
-  console.log('新开一个对话后生效。cookie 不受影响。');
+  printUpdated(best.version, await installUpdate(best, 30000), false);
 }
 
-// 每天最多查一次新版本，有就在命令末尾提醒一句；失败不打扰
-async function notifyUpdate() {
+// 每天第一次使用时检查新版本，有就自动更新并说明更新了什么。
+// 每天只试一次：网络不通或更新失败不影响本次结果，改为提醒，第二天再试。
+async function autoUpdate() {
   try {
     const c = readConfig().updateCheck || {};
+    const d = new Date();
+    const today = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
     let latest = c.latest;
-    if (!c.at || Date.now() - c.at > 24 * 3600e3) {
-      latest = (await fetchLatest(4000)).version;
-      writeConfig({ updateCheck: { at: Date.now(), latest } });
+    if (c.day !== today) {
+      writeConfig({ updateCheck: { ...c, day: today } });
+      try {
+        const best = await checkLatest(5000);
+        latest = best.version;
+        if (cmpVer(latest, VERSION) > 0 && !isPluginInstall()) {
+          printUpdated(latest, await installUpdate(best, 15000), true);
+          return;
+        }
+      } catch { /* 下面照常提醒 */ }
     }
-    if (latest && cmpVer(latest, VERSION) > 0) console.log(`\n提示：li-yuque-skills 有新版本 ${latest}（当前 ${VERSION}），对 AI 说「更新语雀 skill」即可更新。`);
-  } catch { /* 网络不通就下次再查 */ }
+    if (latest && cmpVer(latest, VERSION) > 0) {
+      console.log(isPluginInstall()
+        ? `\n提示：li-yuque-skills 有新版本 ${latest}（当前 ${VERSION}），请在终端运行 claude plugin update li-yuque-skills@li-yuque-skills`
+        : `\n提示：li-yuque-skills 有新版本 ${latest}（当前 ${VERSION}），对 AI 说「更新语雀 skill」即可更新。`);
+    }
+  } catch { /* 本机配置读写失败也不影响命令本身 */ }
 }
 
 // ---------- 入口 ----------
-const HELP = `li-yuque-skills ${VERSION}：语雀知识库下载 / 新建文档
+const HELP = `li-yuque-skills ${VERSION}：语雀文档读取、下载、新建、修改、删除
 
 用法：node yuque.mjs <命令> [参数]
 第一次用、或不知道下一步做什么：运行 guide
@@ -870,7 +1058,7 @@ const HELP = `li-yuque-skills ${VERSION}：语雀知识库下载 / 新建文档
   logout                      删除本机保存的 cookie
   whoami                      查看当前登录的语雀账号
   version                     查看当前版本、安装位置，并检查新版本
-  update                      从 GitHub 更新本 skill 到最新版
+  update                      从 GitHub 更新本 skill 到最新版（平时每天第一次使用时会自动更新）
   books                       列出我的知识库和团队/空间知识库
   read <文档链接...>           直接读取文档正文（输出到终端，不写文件）
   search <关键词> [--book 知识库名或链接] [--limit 条数]
@@ -881,6 +1069,9 @@ const HELP = `li-yuque-skills ${VERSION}：语雀知识库下载 / 新建文档
                               下载为 Markdown，图片存到同目录 img/
   add  <md文件> --book <知识库名或链接> [--under 目录/子目录] [--title 标题] [--yes]
                               新建文档；不加 --yes 只预览不写入
+  edit <文档链接> <md文件> [--title 标题] [--yes]
+                              用本地 Markdown 替换文档全文（需有编辑权限）；不加 --yes 只预览
+  delete <文档链接> [--yes]    删除自己创建、且没有子文档的文档（进回收站）；不加 --yes 只预览
 
 cookie 位置：${COOKIE_FILE}`;
 
@@ -892,10 +1083,14 @@ async function main() {
   const table = {
     guide: cmdGuide, login: cmdLogin, logout: cmdLogout, whoami: cmdWhoami, version: cmdVersion, update: cmdUpdate,
     books: cmdBooks, search: cmdSearch, read: cmdRead, toc: cmdToc, pull: cmdPull, add: cmdAdd,
+    edit: cmdEdit, delete: cmdDelete,
   };
   if (!cmd || args.help || !table[cmd]) { console.log(HELP); return; }
-  await table[cmd](args);
-  if (!['guide', 'version', 'update', 'logout'].includes(cmd)) await notifyUpdate();
+  // 命令出错也照常保存续期的 cookie、做每日更新（新版可能正好修了这个错）
+  try { await table[cmd](args); } finally {
+    await saveRenewedSession();
+    if (!['version', 'update'].includes(cmd)) await autoUpdate();
+  }
 }
 
 main().catch(e => {
