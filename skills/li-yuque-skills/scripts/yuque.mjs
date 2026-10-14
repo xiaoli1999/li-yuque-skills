@@ -983,11 +983,14 @@ async function installUpdate(best, timeout) {
     fs.writeFileSync(`${dest}.new-${process.pid}`, text);
     fs.renameSync(`${dest}.new-${process.pid}`, dest);
   }
-  try {
-    return changesBetween(await fetchFrom(best.mirror, REMOTE_FILES.changelog, timeout), VERSION, best.version);
-  } catch {
-    return []; // 拿不到更新说明不影响更新
+  // 更新说明：哪个来源的 CHANGELOG 已经写到新版本就用哪个（各来源的缓存可能滞后）
+  for (const m of [best.mirror, ...MIRRORS.filter(x => x !== best.mirror)]) {
+    try {
+      const notes = changesBetween(await fetchFrom(m, REMOTE_FILES.changelog, timeout), VERSION, best.version);
+      if (notes.length) return notes;
+    } catch { /* 换下一个来源 */ }
   }
+  return []; // 拿不到更新说明不影响更新
 }
 
 function printUpdated(to, notes, auto) {
