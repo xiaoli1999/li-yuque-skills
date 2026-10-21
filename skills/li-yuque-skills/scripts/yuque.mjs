@@ -10,10 +10,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.7.0';
+const VERSION = '0.8.0';
 // 更新来源：GitHub 原始文件优先，访问不了时用 jsDelivr 镜像（可能滞后几小时）
 const REPO = 'xiaoli1999/li-yuque-skills';
 const BRANCH = 'master';
@@ -90,7 +93,8 @@ async function pace(gap = API_GAP) {
 }
 const isThrottled = (status, text) => status === 429 || status === 503 || (status >= 400 && /频繁|too many|rate.?limit/i.test(text || ''));
 
-async function yq(url, { method = 'GET', json, body, session } = {}) {
+// location: 期望语雀返回跳转（如附件下载），返回跳转地址而不跟过去
+async function yq(url, { method = 'GET', json, body, session, location } = {}) {
   const u = new URL(url);
   // cookie 只允许发往语雀
   if (u.protocol !== 'https:' || !HOST_RE.test(u.hostname)) throw new UserError(`只允许访问 yuque.com，拒绝：${u.hostname}`);
@@ -127,10 +131,12 @@ async function yq(url, { method = 'GET', json, body, session } = {}) {
   if (res.status >= 300 && res.status < 400) {
     const loc = res.headers.get('location') || '';
     if (/login/i.test(loc)) throw new LoginError('语雀登录已失效。');
+    if (location && loc) return new URL(loc, u).href;
     throw new UserError(`语雀返回跳转（${res.status}），链接可能不对：${u.pathname}`);
   }
   if (res.status === 401) throw new LoginError('语雀登录已失效。');
   if (!session) noteSessionCookie(res, token);
+  if (location) throw new UserError(`语雀没有返回下载地址（${res.status}）`);
   text = await res.text();
   if (isThrottled(res.status, text)) throw new UserError('语雀提示访问过于频繁，已停止。请至少过 1 小时再试，期间不要重复运行或同时开多个任务。');
   if (!isApi) {
@@ -283,36 +289,222 @@ function boardToMd(d) {
   return out.join('\n');
 }
 
+// ---------- 表格转 Markdown ----------
+// 表格正文是 JSON，其中 sheet 是 zlib 压缩后按 latin1 存的字符串，解开是工作表数组。
+// 单元格 data[行][列] = { v: 值, t: 数字格式在 vStore.type 里的序号 }；v 是文字、数字，或 {class: link | image | select}。
+// 合并单元格只有左上角有值。
+const escCell = s => s.replace(/\|/g, '\\|').replace(/\r?\n/g, '<br>');
+
+function cellText(cell, types) {
+  const v = cell && cell.v;
+  if (v === undefined || v === null) return '';
+  if (typeof v === 'number') return types[cell.t] === 'n4' ? `${+(v * 100).toFixed(2)}%` : String(v); // n4 = 百分比
+  if (typeof v !== 'object') return String(v);
+  if (v.class === 'image') return v.src ? `![](${v.src})` : '';
+  if (v.class === 'link') return v.url && v.url !== v.text ? `[${v.text || v.url}](${v.url})` : String(v.text || v.url || '');
+  if (Array.isArray(v.value)) return v.value.join('、'); // 下拉选项
+  return String(v.text ?? v.value ?? '');
+}
+
+function sheetToMd(d) {
+  let c = d.content;
+  if (!c) return '> 这是一张空表格。';
+  if (typeof c === 'string') c = JSON.parse(c);
+  if (!c.sheet) return '> 这是一张空表格。';
+  let sheets;
+  try { sheets = JSON.parse(zlib.inflateSync(Buffer.from(c.sheet, 'latin1')).toString('utf8')); } catch { throw new Error('表格内容解不开'); }
+  const out = ['> 语雀表格转写为 Markdown 表格，第一行作表头；合并单元格只保留左上角的值，颜色等样式不保留。', ''];
+  for (const sh of sheets) {
+    const types = (sh.vStore && sh.vStore.type) || [];
+    // 去掉全空的行和列
+    const grid = [], used = new Set();
+    for (const r of Object.keys(sh.data || {}).map(Number).sort((a, b) => a - b)) {
+      const cells = {};
+      for (const [col, cell] of Object.entries(sh.data[r] || {})) {
+        const t = cellText(cell, types).trim();
+        if (t) { cells[col] = escCell(t); used.add(Number(col)); }
+      }
+      if (Object.keys(cells).length) grid.push(cells);
+    }
+    if (sheets.length > 1) out.push(`## ${sh.name || '未命名工作表'}`, '');
+    if (!grid.length) { out.push('（空）', ''); continue; }
+    const cols = [...used].sort((a, b) => a - b);
+    const line = cells => `| ${cols.map(col => cells[col] || '').join(' | ')} |`;
+    out.push(line(grid[0]), `| ${cols.map(() => '---').join(' | ')} |`, ...grid.slice(1).map(line), '');
+  }
+  return out.join('\n');
+}
+
 // ---------- 图片本地化 ----------
 const EXT_BY_TYPE = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp', 'image/svg+xml': '.svg', 'image/bmp': '.bmp' };
+const IMG_RE = /!\[([^\]]*)\]\((https?:\/\/[^)\s]+)([^)]*)\)/g;
 
-async function localizeImages(md, absDir, prefix, stat) {
-  const re = /!\[([^\]]*)\]\((https?:\/\/[^)\s]+)([^)]*)\)/g;
-  const urls = [...new Set([...md.matchAll(re)].map(m => m[2]))];
+// 图片走公开 CDN：同时下载 4 张，每路之间仍隔 0.25 秒，别连发
+const IMG_PARALLEL = 4;
+
+// 下载正文里的图片到 dir，返回 Map(原链接 → 文件名)；nameOf(去掉 # 的链接, 序号, 扩展名) 决定文件名。
+// opt.small：语雀 CDN 上的位图请求宽度不超过 1600 的缩小版（原图常有几 MB 到十几 MB，给 AI 看没必要）；
+// opt.reuse：本地已有同名文件就不再下载（语雀 CDN 的图片地址带唯一编号，内容不会变）
+async function fetchImages(md, dir, nameOf, stat, opt = {}) {
+  const urls = [...new Set([...md.matchAll(IMG_RE)].map(m => m[2]))];
+  // 先按出现顺序定好文件名（扩展名要下载后才知道的除外），同时下载时文件名也不会乱
+  const jobs = urls.map((url, k) => {
+    const clean = url.split('#')[0];
+    let ext = '';
+    try { ext = path.extname(new URL(clean).pathname).toLowerCase(); } catch { return { url, bad: true }; }
+    const known = /^\.(png|jpe?g|gif|webp|svg|bmp)$/.test(ext);
+    return { url, clean, ext, i: k + 1, name: known ? nameOf(clean, k + 1, ext) : null };
+  });
   const local = new Map();
-  let i = 0;
-  for (const url of urls) {
-    i++;
-    if (i > 1) await sleep(250); // 图片走 CDN，也别连发
+  const one = async job => {
+    if (job.bad) throw new Error('链接不对');
+    let { name, ext } = job;
+    const u = new URL(job.clean);
+    // 图片在公开 CDN 上，不带 cookie
+    const get = href => fetch(href, { headers: { 'user-agent': UA, referer: 'https://www.yuque.com/' } });
+    let res = opt.small && u.hostname === 'cdn.nlark.com' && !u.search && /^\.(png|jpe?g|webp|bmp)$/.test(ext)
+      ? await get(`${job.clean}?x-oss-process=image/resize,w_1600,limit_1`) : null;
+    if (!res || !res.ok) res = await get(job.clean);
+    if (!res.ok) throw new Error(String(res.status));
+    if (!name) {
+      ext = EXT_BY_TYPE[(res.headers.get('content-type') || '').split(';')[0].trim()] || '.png';
+      name = nameOf(job.clean, job.i, ext);
+    }
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, name), Buffer.from(await res.arrayBuffer()));
+    return name;
+  };
+  let next = 0;
+  const worker = async () => {
+    let fetched = 0;
+    while (next < jobs.length) {
+      const job = jobs[next++];
+      const p = job.name && path.join(dir, job.name);
+      if (p && opt.reuse && fs.existsSync(p) && fs.statSync(p).size > 0) {
+        local.set(job.url, job.name);
+        stat.img++;
+        continue;
+      }
+      if (fetched++) await sleep(250);
+      try {
+        local.set(job.url, await one(job));
+        stat.img++;
+      } catch {
+        stat.imgFail++;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: IMG_PARALLEL }, worker));
+  return local;
+}
+
+// pull 用：图片存到 img/，正文链接换成本地路径
+async function localizeImages(md, absDir, prefix, stat) {
+  const local = await fetchImages(md, path.join(absDir, 'img'), (url, i, ext) => `${prefix}-${i}${ext}`, stat);
+  return md.replace(IMG_RE, (all, alt, url, rest) => (local.has(url) ? `![${alt}](./img/${local.get(url)}${rest})` : all));
+}
+
+// read 用：文件名取图片链接的最后一段，AI 按正文里的链接就能找到对应文件
+function urlNamer() {
+  const used = new Set();
+  return (url, i, ext) => {
+    const seg = path.basename(new URL(url).pathname);
+    const base = safeName(seg.slice(0, seg.length - path.extname(seg).length));
+    let name = base + ext;
+    for (let n = 2; used.has(name.toLowerCase()); n++) name = `${base} (${n})${ext}`;
+    used.add(name.toLowerCase());
+    return name;
+  };
+}
+
+// ---------- 附件下载 ----------
+// 正文里的附件是 [文件名](https://<空间>.yuque.com/attachments/...)。带 cookie 访问它，语雀返回 302 跳到
+// 阿里云 OSS 的临时签名地址，跳过去下载时不带 cookie。超过大小上限的不下载（实测有几百 MB 的压缩包）。
+const ATTACH_RE = /(?<!!)\[([^\]]*)\]\((https:\/\/(?:[a-z0-9-]+\.)?yuque\.com\/attachments\/[^)\s]+)\)/gi;
+const DEFAULT_MAX_MB = 50;
+const fmtSize = n => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.ceil(n / 1024)} KB`);
+const sizeOver = (n, maxMb) => `${n ? `${fmtSize(n)}，` : ''}超过 ${maxMb} MB 上限`;
+
+function attachLimit(args) {
+  const v = args['max-mb'];
+  if (v === undefined) return DEFAULT_MAX_MB;
+  const n = Number(v);
+  if (typeof v !== 'string' || !(n >= 0)) throw new UserError('--max-mb 后面写单个附件的大小上限，单位 MB，如 --max-mb 500');
+  return n;
+}
+
+// 文件名以下载响应里的为准（链接文字可能带 Markdown 转义）
+function attachName(res, fallback) {
+  const cd = res.headers.get('content-disposition') || '';
+  const m = /filename\*=UTF-8''([^;]+)/i.exec(cd) || /filename="?([^";]+)"?/i.exec(cd);
+  let name = fallback;
+  if (m) { try { name = decodeURIComponent(m[1]); } catch { name = m[1]; } }
+  const ext = path.extname(name);
+  return safeName(name.slice(0, name.length - ext.length)) + ext.replace(/[^.\w]/g, '').slice(0, 12);
+}
+
+// 同一目录下重名的附件依次加 (2)、(3)
+function uniquePath(dir, name, used) {
+  const ext = path.extname(name), base = name.slice(0, name.length - ext.length);
+  for (let n = 1; ; n++) {
+    const p = path.join(dir, n === 1 ? name : `${base} (${n})${ext}`);
+    if (!used.has(p.toLowerCase())) { used.add(p.toLowerCase()); return p; }
+  }
+}
+
+async function downloadAttachment(url, dir, fallback, maxMb, used) {
+  const loc = new URL(await yq(url, { location: true }));
+  if (loc.protocol !== 'https:' || HOST_RE.test(loc.hostname)) throw new Error('语雀返回的下载地址不对');
+  // 不要压缩：OSS 对 html 等文本默认 gzip，那样响应里没有文件大小，没法先判断是否超过上限
+  const res = await fetch(loc, { headers: { 'user-agent': UA, 'accept-encoding': 'identity' } });
+  if (!res.ok) throw new Error(`下载失败（${res.status}）`);
+  const limit = maxMb * 1048576;
+  const size = Number(res.headers.get('content-length')) || 0;
+  const name = attachName(res, fallback);
+  if (size > limit) { await res.body.cancel(); return { name, size, big: true }; }
+  fs.mkdirSync(dir, { recursive: true });
+  const abs = uniquePath(dir, name, used);
+  let got = 0;
+  try {
+    // 没给大小时边下边数，超过上限就停
+    await pipeline(Readable.fromWeb(res.body), async function* (src) {
+      for await (const chunk of src) {
+        got += chunk.length;
+        if (got > limit) throw new Error('TOO_BIG');
+        yield chunk;
+      }
+    }, fs.createWriteStream(abs + '.part'));
+    fs.renameSync(abs + '.part', abs);
+  } catch (e) {
+    fs.rmSync(abs + '.part', { force: true });
+    used.delete(abs.toLowerCase());
+    if (e.message === 'TOO_BIG') return { name, size: 0, big: true }; // 实际大小不知道
+    throw e;
+  }
+  return { name: path.basename(abs), size: got, abs };
+}
+
+// 下载正文里的附件到 dir。stat：{ used: Set, done: Map }，跨文档共用，避免同目录重名、同一附件重复下载。
+// 返回每个附件的结果：{ url, text, name, size, abs } 已下载；big 超过上限；error 失败
+async function fetchAttachments(md, dir, maxMb, stat) {
+  const seen = new Map();
+  for (const m of md.matchAll(ATTACH_RE)) if (!seen.has(m[2])) seen.set(m[2], m[1].replace(/\\(.)/g, '$1'));
+  const out = [];
+  for (const [url, text] of seen) {
+    const key = `${dir}\n${url}`;
     try {
-      const clean = url.split('#')[0];
-      // 图片在公开 CDN 上，不带 cookie
-      const res = await fetch(clean, { headers: { 'user-agent': UA, referer: 'https://www.yuque.com/' } });
-      if (!res.ok) throw new Error(String(res.status));
-      const type = (res.headers.get('content-type') || '').split(';')[0].trim();
-      let ext = path.extname(new URL(clean).pathname).toLowerCase();
-      if (!/^\.(png|jpe?g|gif|webp|svg|bmp)$/.test(ext)) ext = EXT_BY_TYPE[type] || '.png';
-      const name = `${prefix}-${i}${ext}`;
-      fs.mkdirSync(path.join(absDir, 'img'), { recursive: true });
-      fs.writeFileSync(path.join(absDir, 'img', name), Buffer.from(await res.arrayBuffer()));
-      local.set(url, `./img/${name}`);
-      stat.img++;
-    } catch {
-      stat.imgFail++;
+      if (!stat.done.has(key)) stat.done.set(key, await downloadAttachment(url, dir, text || path.basename(new URL(url).pathname), maxMb, stat.used));
+      out.push({ url, text, ...stat.done.get(key) });
+    } catch (e) {
+      if (e instanceof LoginError) throw e;
+      out.push({ url, text, name: text, error: e.message });
     }
   }
-  return md.replace(re, (all, alt, url, rest) => (local.has(url) ? `![${alt}](${local.get(url)}${rest})` : all));
+  return out;
 }
+
+// 本地路径写进 Markdown 链接：空格、括号、% 转义，其余（包括中文）原样，add / edit 读得回来
+const mdPath = p => p.replace(/[% ()]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
 
 // ---------- 命令：login / whoami ----------
 async function whoami(session) {
@@ -515,17 +707,19 @@ async function fetchDoc(book, slug) {
     if (typeof d.sourcecode !== 'string') throw new Error('没拿到正文');
     return { kind: 'doc', d, md: d.sourcecode };
   }
-  if (type === 'board') {
+  // 画板、表格的 Markdown 模式没有正文，要再取一次原始内容自己转
+  if (type === 'board' || type === 'sheet') {
     const r2 = await yq(`https://${book.host}/api/docs/${encodeURIComponent(slug)}?${q}`);
-    return { kind: 'board', d: r2.data, md: boardToMd(r2.data) };
+    return { kind: type, d: r2.data, md: type === 'board' ? boardToMd(r2.data) : sheetToMd(r2.data) };
   }
-  return { kind: 'skip', d, type: d.type || '未知' };
+  return { kind: 'skip', d, type: d.type === 'Table' ? '数据表' : d.type || '未知' };
 }
 
-// ---------- 命令：read（发链接直接读，正文输出到终端给 AI，不写文件） ----------
+// ---------- 命令：read（发链接直接读，正文输出到终端给 AI；只有图片、附件写到临时目录） ----------
 async function cmdRead(args) {
   const links = args._.slice(1);
-  if (!links.length) throw new UserError('用法：read <文档链接> [更多文档链接...]');
+  if (!links.length) throw new UserError('用法：read <文档链接> [更多文档链接...] [--max-mb 附件大小上限]');
+  const maxMb = attachLimit(args);
   for (const link of links) {
     const book = await loadBook(await resolveBookRef(link));
     if (!book.docSlug) {
@@ -549,14 +743,28 @@ async function cmdRead(args) {
       continue;
     }
     const md = r.md.replace(/<a\b[^>]*?>(\s*?)<\/a>/g, '').trim();
-    console.log(`# ${r.d.title}\n\n> 知识库：${book.name} · 更新：${bj(r.d.content_updated_at || r.d.updated_at)} · 原文：<${url}>\n\n${md}\n`);
+    // 图片和附件下载到临时目录给 AI 打开；正文里的链接不改，修改文档时原样保留
+    const dir = path.join(os.tmpdir(), 'li-yuque-skills', safeName(`${book.slug}-${book.docSlug}`));
+    const img = { img: 0, imgFail: 0 };
+    await fetchImages(md, path.join(dir, 'img'), urlNamer(), img, { small: true, reuse: true });
+    const atts = await fetchAttachments(md, dir, maxMb, { used: new Set(), done: new Map() });
+    const notes = [];
+    if (img.img) notes.push(`> 图片已下载到本机：${path.join(dir, 'img')}（${img.img} 张，文件名取自图片链接的最后一段，宽度超过 1600 像素的已缩小${img.imgFail ? `；另有 ${img.imgFail} 张下载失败` : ''}）`);
+    else if (img.imgFail) notes.push(`> 图片未下载：${img.imgFail} 张都下载失败`);
+    for (const a of atts) {
+      notes.push(a.abs ? `> 附件已下载到本机：${a.name}（${fmtSize(a.size)}）→ ${a.abs}`
+        : `> 附件未下载：${a.name}（${a.big ? `${sizeOver(a.size, maxMb)}，需要时加 --max-mb ${a.size ? Math.ceil(a.size / 1048576) : maxMb * 10} 再读` : a.error}）`);
+    }
+    const meta = [`> 知识库：${book.name} · 更新：${bj(r.d.content_updated_at || r.d.updated_at)} · 原文：<${url}>`, ...notes].join('\n');
+    console.log(`# ${r.d.title}\n\n${meta}\n\n${md}\n`);
     if (links.length > 1) console.log('\n---\n');
   }
 }
 
 async function cmdPull(args) {
   const link = args._[1];
-  if (!link) throw new UserError('用法：pull <知识库名、知识库链接或文档链接> [--dir 目录/子目录] [--out 本地目录]');
+  if (!link) throw new UserError('用法：pull <知识库名、知识库链接或文档链接> [--dir 目录/子目录] [--out 本地目录] [--max-mb 附件大小上限]');
+  const maxMb = attachLimit(args);
   const book = await loadBook(await resolveBookRef(link));
   const roots = buildTree(book.toc);
   const outRoot = path.resolve(args.out || path.join(process.cwd(), safeName(book.name)));
@@ -593,7 +801,7 @@ async function cmdPull(args) {
     return;
   }
   console.log(`共 ${plan.length} 篇，预计约 ${minutes} 分钟，保存到：${outRoot}\n`);
-  const stat = { ok: 0, board: 0, img: 0, imgFail: 0 };
+  const stat = { ok: 0, board: 0, sheet: 0, img: 0, imgFail: 0, att: 0, attBig: [], attFail: [], used: new Set(), done: new Map() };
   for (let i = 0; i < plan.length; i++) {
     const p = plan[i];
     const docUrl = `${book.url}/${p.slug}`;
@@ -609,21 +817,32 @@ async function cmdPull(args) {
       fs.mkdirSync(dir, { recursive: true });
       let md = r.md.replace(/<a\b[^>]*?>(\s*?)<\/a>/g, '');
       md = await localizeImages(md, dir, p.slug, stat);
+      const atts = await fetchAttachments(md, path.join(dir, 'files'), maxMb, stat);
+      const local = new Map(atts.filter(a => a.abs).map(a => [a.url, `./files/${mdPath(path.basename(a.abs))}`]));
+      md = md.replace(ATTACH_RE, (all, text, url) => (local.has(url) ? `[${text}](${local.get(url)})` : all));
+      for (const a of atts) {
+        if (a.big) stat.attBig.push(`${p.title}：${a.name}（${sizeOver(a.size, maxMb)}）`);
+        else if (a.error) stat.attFail.push(`${p.title}：${a.name}（${a.error}）`);
+      }
+      stat.att += local.size;
       const title = r.d.title || p.title;
       const foot = `\n\n> 更新：${bj(r.d.content_updated_at || r.d.updated_at)} · 原文：<${docUrl}>\n`;
       fs.writeFileSync(abs, `# ${title}\n\n${md.trim()}${foot}`);
       stat.ok++;
       if (r.kind === 'board') stat.board++;
-      console.log(`[${i + 1}/${plan.length}] ${p.file}`);
+      if (r.kind === 'sheet') stat.sheet++;
+      console.log(`[${i + 1}/${plan.length}] ${p.file}${local.size ? `（附件 ${local.size} 个）` : ''}`);
     } catch (e) {
       if (e instanceof LoginError) throw e;
       failed.push(`${p.title}：${e.message} ${docUrl}`);
       console.log(`[${i + 1}/${plan.length}] 失败 ${p.title}：${e.message}`);
     }
   }
-  console.log(`\n完成：成功 ${stat.ok} 篇（其中画板 ${stat.board} 篇），跳过 ${skipped.length} 篇，失败 ${failed.length} 篇；图片 ${stat.img} 张，失败 ${stat.imgFail} 张（失败的保留原链接）。`);
+  console.log(`\n完成：成功 ${stat.ok} 篇（其中画板 ${stat.board} 篇、表格 ${stat.sheet} 篇），跳过 ${skipped.length} 篇，失败 ${failed.length} 篇；图片 ${stat.img} 张，失败 ${stat.imgFail} 张；附件 ${stat.att} 个，未下载 ${stat.attBig.length + stat.attFail.length} 个（没下载的都保留原链接）。`);
   console.log(`位置：${outRoot}`);
-  if (skipped.length) console.log('\n跳过（表格、数据表等暂不支持）：\n' + skipped.map(s => '  - ' + s).join('\n'));
+  if (stat.attBig.length) console.log('\n超过大小上限未下载的附件（需要时加 --max-mb 调高上限再下载）：\n' + stat.attBig.map(s => '  - ' + s).join('\n'));
+  if (stat.attFail.length) console.log('\n下载失败的附件：\n' + stat.attFail.map(s => '  - ' + s).join('\n'));
+  if (skipped.length) console.log('\n跳过（数据表等暂不支持）：\n' + skipped.map(s => '  - ' + s).join('\n'));
   if (failed.length) console.log('\n失败：\n' + failed.map(s => '  - ' + s).join('\n'));
 }
 
@@ -726,6 +945,8 @@ async function loadDocByLink(link) {
 // ---------- 命令：edit（用本地 Markdown 替换已有文档的全文） ----------
 // read / pull 输出里的说明行：「> 知识库：… · 更新：… · 原文：<链接>」或「> 更新：… · 原文：<链接>」
 const META_RE = /^>\s*(?:知识库：.*?·\s*)?更新：\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2})?\s*·\s*原文：<(https:\/\/[^>\s]+)>[ \t]*\r?$/gm;
+// read 输出里紧跟说明行的图片、附件下载情况，也不是正文
+const ATT_NOTE_RE = /^>\s*(?:图片|附件)(?:已下载到本机|未下载)：.*$/gm;
 
 async function cmdEdit(args) {
   const [, link, file] = args._;
@@ -738,7 +959,7 @@ async function cmdEdit(args) {
   // 去掉 read / pull 加的说明行；其中的「更新」时间是修改的底稿时间，用来发现别人后来又改过
   let md = fs.readFileSync(abs, 'utf8').replace(/^﻿/, '');
   const base = [...md.matchAll(META_RE)].find(m => m[1] && m[2].split(/[?#]/)[0].endsWith(`/${book.docSlug}`));
-  md = md.replace(META_RE, '');
+  md = md.replace(META_RE, '').replace(ATT_NOTE_RE, '');
   const h1 = /^\s*#\s+(.+?)\s*#*\s*(\r?\n|$)/.exec(md);
   const title = String(args.title || (h1 && h1[1]) || doc.title).trim();
   if (h1 && h1[1].trim() === title) md = md.slice(h1[0].length);
@@ -1063,13 +1284,14 @@ const HELP = `li-yuque-skills ${VERSION}：语雀文档读取、下载、新建�
   version                     查看当前版本、安装位置，并检查新版本
   update                      从 GitHub 更新本 skill 到最新版（平时每天第一次使用时会自动更新）
   books                       列出我的知识库和团队/空间知识库
-  read <文档链接...>           直接读取文档正文（输出到终端，不写文件）
+  read <文档链接...> [--max-mb 附件大小上限]
+                              直接读取文档或表格（输出到终端）；图片和附件下载到本机临时目录，附件默认单个不超过 ${DEFAULT_MAX_MB} MB
   search <关键词> [--book 知识库名或链接] [--limit 条数]
                               按目录和标题模糊搜索文档（不填 --book 则搜全部可访问的知识库）
   toc  <知识库名或链接> [--dir 目录/子目录] [--depth 层数]
                               查看目录结构
-  pull <知识库名、知识库链接或文档链接> [--dir 目录/子目录] [--out 本地目录] [--yes]
-                              下载为 Markdown，图片存到同目录 img/
+  pull <知识库名、知识库链接或文档链接> [--dir 目录/子目录] [--out 本地目录] [--max-mb 附件大小上限] [--yes]
+                              下载为 Markdown（表格转成 Markdown 表格），图片存到同目录 img/，附件存到 files/（默认单个不超过 ${DEFAULT_MAX_MB} MB）
   add  <md文件> --book <知识库名或链接> [--under 目录/子目录] [--title 标题] [--yes]
                               新建文档；不加 --yes 只预览不写入
   edit <文档链接> <md文件> [--title 标题] [--yes]

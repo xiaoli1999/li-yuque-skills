@@ -35,7 +35,8 @@ Talk to your agent:
 | Update | Update the Yuque skill / Update the Yuque cookie, it's copied |
 
 - **Log in**: open Yuque in your browser, press F12 → Application → Cookies → `https://www.yuque.com`, and copy the value of `_yuque_session`. **Do not paste it into the chat** — the agent reads it from the clipboard.
-- **Read a link**: paste one or more document links; the agent reads them and answers directly without saving files.
+- **Read a link**: paste one or more document or spreadsheet links; the agent reads them and answers directly, and can open the images and attachments (HTML prototypes, PDFs, etc.) too.
+- **Download**: spreadsheets become Markdown tables, images go to `img/` and attachments to `files/`; attachments over 50 MB are skipped by default, and the agent can raise the limit.
 - **Create**: the agent shows a preview (knowledge base, folder, title) and publishes only after you confirm.
 - **Edit**: works on any document you can edit (yours or your teammates'). The agent reads the latest version first and replaces the whole body; styles Markdown can't express (font colors, cards, etc.) are lost. Yuque keeps version history, so mistakes can be rolled back.
 - **Delete**: only documents you created and that have no child documents. Deleted documents go to the knowledge base's recycle bin and can be restored.

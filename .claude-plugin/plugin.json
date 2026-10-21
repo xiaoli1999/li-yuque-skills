@@ -2,7 +2,7 @@
   "name": "li-yuque-skills",
   "displayName": "语雀文档读写",
   "description": "读取、搜索、下载语雀文档，新建和修改文档，删除自己创建的文档。写操作都先预览，确认后才执行。",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "author": { "name": "xiaoli1999" },
   "homepage": "https://github.com/xiaoli1999/li-yuque-skills",
   "repository": "https://github.com/xiaoli1999/li-yuque-skills",
