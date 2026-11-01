@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// li-yuque-skills：读取、搜索、下载语雀文档，新建、修改文档，删除自己创建的文档。零依赖，需要 Node 18 及以上。
+// li-yuque-skills：读取、搜索、下载语雀文档，新建、修改文档和表格，删除自己创建的文档。零依赖，需要 Node 18 及以上。
 // 安全约定：
 //   1. 写操作只有新建、修改、删除三种；删除只允许删本人创建、且没有子文档的文档。
 //   2. 写操作都先预览，用户确认后带 --yes 才执行；访问范围只受账号自身权限约束。
@@ -16,7 +16,7 @@ import { pipeline } from 'node:stream/promises';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.8.0';
+const VERSION = '0.9.0';
 // 更新来源：GitHub 原始文件优先，访问不了时用 jsDelivr 镜像（可能滞后几小时）
 const REPO = 'xiaoli1999/li-yuque-skills';
 const BRANCH = 'master';
@@ -291,19 +291,78 @@ function boardToMd(d) {
 
 // ---------- 表格转 Markdown ----------
 // 表格正文是 JSON，其中 sheet 是 zlib 压缩后按 latin1 存的字符串，解开是工作表数组。
-// 单元格 data[行][列] = { v: 值, t: 数字格式在 vStore.type 里的序号 }；v 是文字、数字，或 {class: link | image | select}。
-// 合并单元格只有左上角有值。
+// 单元格 data[行][列] = { v: 值, t: 数字格式在 vStore.type 里的序号, s: 样式序号 }；
+// v 是文字、数字，或 {class: link | image | select | checkbox | formula}。合并单元格只有左上角有值。
 const escCell = s => s.replace(/\|/g, '\\|').replace(/\r?\n/g, '<br>');
+const packSheets = sheets => zlib.deflateSync(Buffer.from(JSON.stringify(sheets), 'utf8')).toString('latin1');
+// 编辑器也接受 sheet 直接是数组
+const unpackSheets = s => (typeof s === 'string' ? JSON.parse(zlib.inflateSync(Buffer.from(s, 'latin1')).toString('utf8')) : s);
+
+// 数字格式串形如 "n4_d1"、"n5_s¥_d2"、"n6_f1"：按 _ 拆开，首字母是键（n 类型、d 小数位、s 符号、f 日期格式号）。
+// 类型：1 自动、2 文本、3 数字、4 百分比、5 货币、6 日期、7 时间、8 日期时间
+function parseFmt(tok) {
+  const o = {};
+  for (const p of String(tok || '').split('_')) if (p) o[p[0]] = p.slice(1);
+  const num = x => (x === undefined || x === '' || Number.isNaN(Number(x)) ? undefined : Number(x));
+  return { name: num(o.n) || 0, d: num(o.d), s: o.s, f: num(o.f) };
+}
+
+// 日期类的值是从 1899-12-30T00:00Z 起的秒数，按 UTC 换算
+const SHEET_EPOCH = Date.UTC(1899, 11, 30);
+const pad2 = n => String(n).padStart(2, '0');
+function fmtDate(v, name, f) {
+  const t = new Date(SHEET_EPOCH + Math.round(v * 1000));
+  const Y = t.getUTCFullYear(), M = t.getUTCMonth() + 1, D = t.getUTCDate();
+  const date = `${Y}-${pad2(M)}-${pad2(D)}`;
+  const time = `${pad2(t.getUTCHours())}:${pad2(t.getUTCMinutes())}:${pad2(t.getUTCSeconds())}`;
+  if (f === 1) return date;
+  if (f === 2) return `${date} ${time}`;
+  if (f === 19) return `${Y}/${pad2(M)}/${pad2(D)}`;
+  if (f === 20) return `${Y}年${M}月${D}日`;
+  return name === 7 ? time : name === 8 ? `${date} ${time}` : date;
+}
+
+function fmtNumber(v, fmt) {
+  if (!Number.isFinite(v)) return String(v);
+  const { name } = fmt;
+  const d = fmt.d === undefined ? undefined : Math.min(Math.max(fmt.d, 0), 20);
+  if (name >= 6 && name <= 8) return fmtDate(v, name, fmt.f);
+  if (name === 4) return `${d === undefined ? +(v * 100).toFixed(2) : (v * 100).toFixed(d)}%`;
+  const n = d !== undefined && (name === 3 || name === 5) ? v.toFixed(d) : String(v);
+  return name === 5 ? `${fmt.s || ''}${n}` : n;
+}
 
 function cellText(cell, types) {
   const v = cell && cell.v;
   if (v === undefined || v === null) return '';
-  if (typeof v === 'number') return types[cell.t] === 'n4' ? `${+(v * 100).toFixed(2)}%` : String(v); // n4 = 百分比
+  if (typeof v === 'number') return fmtNumber(v, parseFmt(cell.t === undefined ? '' : types[cell.t]));
   if (typeof v !== 'object') return String(v);
   if (v.class === 'image') return v.src ? `![](${v.src})` : '';
   if (v.class === 'link') return v.url && v.url !== v.text ? `[${v.text || v.url}](${v.url})` : String(v.text || v.url || '');
+  if (v.class === 'checkbox') return v.value && v.value !== 'false' ? '[x]' : '[ ]';
+  if (v.class === 'formula') {
+    // 有缓存的计算结果就显示结果，没有就显示公式
+    const val = v.value;
+    return val === '' || val === null || val === undefined ? `=${v.formula || ''}` : cellText({ v: val, t: cell.t }, types);
+  }
   if (Array.isArray(v.value)) return v.value.join('、'); // 下拉选项
   return String(v.text ?? v.value ?? '');
+}
+
+// 去掉全空的行和列，得到读和写共用的网格：rows / cols 是原始行号、列号，text[i][j] 是转义后的单元格文字
+function sheetGrid(sh) {
+  const types = (sh.vStore && sh.vStore.type) || [];
+  const rows = [], lines = [], used = new Set();
+  for (const r of Object.keys(sh.data || {}).map(Number).sort((a, b) => a - b)) {
+    const cells = {};
+    for (const [col, cell] of Object.entries(sh.data[r] || {})) {
+      const t = cellText(cell, types).trim();
+      if (t) { cells[col] = escCell(t); used.add(Number(col)); }
+    }
+    if (Object.keys(cells).length) { rows.push(r); lines.push(cells); }
+  }
+  const cols = [...used].sort((a, b) => a - b);
+  return { rows, cols, text: lines.map(cells => cols.map(col => cells[col] || '')) };
 }
 
 function sheetToMd(d) {
@@ -312,25 +371,14 @@ function sheetToMd(d) {
   if (typeof c === 'string') c = JSON.parse(c);
   if (!c.sheet) return '> 这是一张空表格。';
   let sheets;
-  try { sheets = JSON.parse(zlib.inflateSync(Buffer.from(c.sheet, 'latin1')).toString('utf8')); } catch { throw new Error('表格内容解不开'); }
-  const out = ['> 语雀表格转写为 Markdown 表格，第一行作表头；合并单元格只保留左上角的值，颜色等样式不保留。', ''];
+  try { sheets = unpackSheets(c.sheet); } catch { throw new Error('表格内容解不开'); }
+  const out = ['> 语雀表格转写为 Markdown 表格，第一行作表头；合并单元格只保留左上角的值，颜色等样式不显示。改好后可以用 edit 写回，没改的单元格样式不变。', ''];
   for (const sh of sheets) {
-    const types = (sh.vStore && sh.vStore.type) || [];
-    // 去掉全空的行和列
-    const grid = [], used = new Set();
-    for (const r of Object.keys(sh.data || {}).map(Number).sort((a, b) => a - b)) {
-      const cells = {};
-      for (const [col, cell] of Object.entries(sh.data[r] || {})) {
-        const t = cellText(cell, types).trim();
-        if (t) { cells[col] = escCell(t); used.add(Number(col)); }
-      }
-      if (Object.keys(cells).length) grid.push(cells);
-    }
+    const g = sheetGrid(sh);
     if (sheets.length > 1) out.push(`## ${sh.name || '未命名工作表'}`, '');
-    if (!grid.length) { out.push('（空）', ''); continue; }
-    const cols = [...used].sort((a, b) => a - b);
-    const line = cells => `| ${cols.map(col => cells[col] || '').join(' | ')} |`;
-    out.push(line(grid[0]), `| ${cols.map(() => '---').join(' | ')} |`, ...grid.slice(1).map(line), '');
+    if (!g.rows.length) { out.push('（空）', ''); continue; }
+    const line = cells => `| ${cells.join(' | ')} |`;
+    out.push(line(g.text[0]), `| ${g.cols.map(() => '---').join(' | ')} |`, ...g.text.slice(1).map(line), '');
   }
   return out.join('\n');
 }
@@ -930,7 +978,7 @@ async function uploadLocals(book, docId, md, uploads) {
   return md;
 }
 
-// 按文档链接取知识库和文档详情（修改、删除只认单篇文档的链接）
+// 按文档链接取知识库和文档详情（修改、删除只认单篇文档或表格的链接）
 async function loadDocByLink(link) {
   if (!/^https?:\/\//i.test(String(link))) throw new UserError(`需要文档链接（https://...yuque.com/...），收到：${link}。不知道链接时先用 search 找。`);
   const book = await loadBook(link);
@@ -938,7 +986,7 @@ async function loadDocByLink(link) {
   const r = await yq(`https://${book.host}/api/docs/${encodeURIComponent(book.docSlug)}?book_id=${book.id}&merge_dynamic_data=false`);
   const doc = r.data || {};
   if (!doc.id) throw new UserError(`打不开这篇文档：${link}`);
-  if (String(doc.type || '').toLowerCase() !== 'doc') throw new UserError(`「${doc.title}」是${doc.type || '未知'}类型，只支持普通文档。`);
+  if (!['doc', 'sheet'].includes(String(doc.type || '').toLowerCase())) throw new UserError(`「${doc.title}」是${doc.type || '未知'}类型，只支持普通文档和表格。`);
   return { book, doc, url: `${book.url}/${book.docSlug}`, abilities: doc.abilities || {} };
 }
 
@@ -950,11 +998,13 @@ const ATT_NOTE_RE = /^>\s*(?:图片|附件)(?:已下载到本机|未下载)：.*
 
 async function cmdEdit(args) {
   const [, link, file] = args._;
-  if (!link || !file) throw new UserError('用法：edit <文档链接> <md文件> [--title 标题] [--yes]');
+  if (!link || !file) throw new UserError('用法：edit <文档或表格链接> <md文件> [--title 标题] [--yes]');
   const abs = path.resolve(file);
   if (!fs.existsSync(abs)) throw new UserError(`文件不存在：${abs}`);
   const { book, doc, url, abilities } = await loadDocByLink(link);
   if (!abilities.update) throw new UserError(`没有「${doc.title}」的编辑权限：${url}`);
+  // 表格按单元格合并写回，普通文档整篇替换
+  if (String(doc.type).toLowerCase() === 'sheet') return editSheet(args, { book, doc, url, abilities }, abs);
 
   // 去掉 read / pull 加的说明行；其中的「更新」时间是修改的底稿时间，用来发现别人后来又改过
   let md = fs.readFileSync(abs, 'utf8').replace(/^﻿/, '');
@@ -1010,10 +1060,583 @@ async function saveDoc(book, slug, id, title, md, publish, url) {
 }
 const DRAFT_NOT_SYNCED = '注意：已发布，但网页编辑器里的草稿没有同步。之后在网页上编辑这篇前，请先确认编辑器里是新内容。';
 
-// ---------- 命令：delete（只删自己创建、且没有子文档的文档） ----------
+// ---------- 命令：edit 表格（把 read 输出的 Markdown 表格按单元格合并写回） ----------
+// 只改文字有变化的单元格，没改的单元格对象原样保留（样式、下拉、链接、公式都不丢）。
+// 行按整行文字做最长公共子序列对齐，插入、删除行按电子表格的插入、删除行平移后面的行。
+
+// 按「## 工作表名」分节，节内只取 | 开头的行；每段连续表格行的第 2 行若是 | --- | 分隔行就跳过
+function parseMdTables(md) {
+  const sections = [{ name: null, rows: [] }];
+  let run = 0;
+  for (const raw of md.split(/\r?\n/)) {
+    const line = raw.trim();
+    const h = /^##(?!#)\s*(.+?)\s*$/.exec(line);
+    if (h) { sections.push({ name: h[1], rows: [] }); run = 0; continue; }
+    if (!line.startsWith('|')) { run = 0; continue; }
+    run++;
+    const cells = splitMdRow(line);
+    if (run === 2 && cells.every(c => /^:?-{3,}:?$/.test(c))) continue;
+    sections[sections.length - 1].rows.push(cells);
+  }
+  return sections;
+}
+
+// 按没有转义的 | 切分；单元格保持转义形式（\| 和 <br>），方便和读取时的文字逐字比较
+function splitMdRow(line) {
+  let s = line.slice(1);
+  if (/(^|[^\\])\|$/.test(s)) s = s.slice(0, -1);
+  return s.split(/(?<!\\)\|/).map(x => x.trim());
+}
+const mdCellText = s => s.replace(/\\\|/g, '|').replace(/<br\s*\/?>/gi, '\n');
+
+// 文件里的各节对应到工作表
+function matchSections(sections, sheets) {
+  const names = sheets.map(sh => sh.name || '未命名工作表');
+  const named = sections.slice(1);
+  if (!named.length) {
+    if (!sections[0].rows.length) throw new UserError('文件里没有 Markdown 表格（| 开头的行）。');
+    if (sheets.length > 1) throw new UserError(`这个表格有 ${sheets.length} 个工作表（${names.join('、')}），请在文件里用「## 工作表名」标明每段表格属于哪个工作表。`);
+    return [{ idx: 0, rows: sections[0].rows }];
+  }
+  if (sections[0].rows.length) throw new UserError('第一个「## 工作表名」之前有表格行，请把它放到对应的工作表标题下面。');
+  const out = [], seen = new Set();
+  for (const s of named) {
+    const idx = names.indexOf(s.name);
+    if (idx < 0) throw new UserError(`没有叫「${s.name}」的工作表，现有工作表：${names.join('、')}（暂不支持新建工作表）。`);
+    if (seen.has(idx)) throw new UserError(`「## ${s.name}」出现了不止一次。`);
+    seen.add(idx);
+    out.push({ idx, rows: s.rows });
+  }
+  return out;
+}
+
+// 行对齐：先按整行文字求最长公共子序列；两个匹配行之间，没匹配上的新行和旧行按顺序配对（视为改过的行），
+// 多出的新行是插入（before = 它后面那个旧行的下标，等于旧行数表示末尾），多出的旧行是删除。
+// 返回 ops（按新顺序：keep 匹配、pair 配对、ins 插入）和 del（被删的旧行下标）
+function alignRows(oldKeys, newKeys) {
+  const n = newKeys.length, m = oldKeys.length;
+  let pre = 0;
+  while (pre < n && pre < m && newKeys[pre] === oldKeys[pre]) pre++;
+  let suf = 0;
+  while (suf < n - pre && suf < m - pre && newKeys[n - 1 - suf] === oldKeys[m - 1 - suf]) suf++;
+  const N = n - pre - suf, M = m - pre - suf;
+  if (N * M > 1e7) throw new UserError('改动的行太多，一次对齐不了，请分几次修改。');
+  const W = M + 1, dp = new Int32Array((N + 1) * W);
+  for (let i = N - 1; i >= 0; i--) {
+    for (let j = M - 1; j >= 0; j--) {
+      dp[i * W + j] = newKeys[pre + i] === oldKeys[pre + j] ? dp[(i + 1) * W + j + 1] + 1 : Math.max(dp[(i + 1) * W + j], dp[i * W + j + 1]);
+    }
+  }
+  const pairs = [];
+  for (let x = 0; x < pre; x++) pairs.push([x, x]);
+  for (let i = 0, j = 0; i < N && j < M;) {
+    if (newKeys[pre + i] === oldKeys[pre + j]) { pairs.push([pre + i, pre + j]); i++; j++; }
+    else if (dp[(i + 1) * W + j] >= dp[i * W + j + 1]) i++;
+    else j++;
+  }
+  for (let x = 0; x < suf; x++) pairs.push([n - suf + x, m - suf + x]);
+  const ops = [], del = [];
+  let pn = 0, po = 0;
+  for (const [an, ao] of [...pairs, [n, m]]) {
+    const k = Math.min(an - pn, ao - po);
+    for (let x = 0; x < k; x++) ops.push({ type: 'pair', n: pn + x, o: po + x });
+    for (let x = pn + k; x < an; x++) ops.push({ type: 'ins', n: x, before: ao });
+    for (let x = po + k; x < ao; x++) del.push(x);
+    if (an < n) ops.push({ type: 'keep', n: an, o: ao });
+    pn = an + 1;
+    po = ao + 1;
+  }
+  return { ops, del };
+}
+
+// 旧行号 → 新行号（删除的行返回 null），并给每个插入行算出新行号 op.row。
+// 插入行占据它后面那个旧行的位置（末尾插入放在最后一个有内容的行之后），后面的行整体下移；删除行后面的整体上移
+function rowMapper(gridRows, ops, del) {
+  const lastRow = gridRows.length ? gridRows[gridRows.length - 1] : -1;
+  const ins = ops.filter(o => o.type === 'ins');
+  for (const o of ins) o.P = o.before < gridRows.length ? gridRows[o.before] : lastRow + 1;
+  const P = ins.map(o => o.P).sort((a, b) => a - b);
+  const D = del.map(k => gridRows[k]).sort((a, b) => a - b);
+  const deleted = new Set(D);
+  const countLE = (arr, x) => {
+    let lo = 0, hi = arr.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid] <= x) lo = mid + 1; else hi = mid; }
+    return lo;
+  };
+  const map = R => (deleted.has(R) ? null : R + countLE(P, R) - countLE(D, R - 1));
+  const seen = new Map();
+  for (const o of ins) {
+    const q = seen.get(o.P) || 0;
+    seen.set(o.P, q + 1);
+    o.row = o.P + countLE(P, o.P - 1) + q - countLE(D, o.P - 1);
+  }
+  return map;
+}
+
+// ----- 新文字的解析 -----
+const NUM_RE = /^-?(0|[1-9]\d*)(\.\d+)?$/;
+// 纯数字才当数字：有前导 0、超过 15 位、或写法不规范（1,000、1e5、.5）的保持文字
+const parseNum = s => (NUM_RE.test(s) && s.replace(/[-.]/g, '').length <= 15 ? Number(s) : null);
+const PCT_RE = /^(-?(?:0|[1-9]\d*)(?:\.(\d+))?)%$/;
+function parsePct(s) {
+  const m = PCT_RE.exec(s);
+  if (!m || m[1].replace(/[-.]/g, '').length > 15) return null;
+  return { v: +(Number(m[1]) / 100).toPrecision(15), d: (m[2] || '').length };
+}
+const DATE_RE = /^(\d{4})(?:([-/])(\d{1,2})\2(\d{1,2})|年(\d{1,2})月(\d{1,2})日)(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/;
+const TIME_RE = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/;
+function parseDate(s) {
+  const m = DATE_RE.exec(s);
+  if (!m) return null;
+  const y = +m[1], mo = +(m[3] || m[5]), d = +(m[4] || m[6]);
+  const hh = +(m[7] || 0), mi = +(m[8] || 0), ss = +(m[9] || 0);
+  if (mo < 1 || mo > 12 || d < 1 || hh > 23 || mi > 59 || ss > 59) return null;
+  const ms = Date.UTC(y, mo - 1, d, hh, mi, ss);
+  if (new Date(ms).getUTCDate() !== d) return null;
+  const sep = m[2] || '年', time = m[7] !== undefined;
+  return { v: (ms - SHEET_EPOCH) / 1000, tok: time ? 'n8_f2' : sep === '-' ? 'n6_f1' : sep === '/' ? 'n6_f19' : 'n6_f20' };
+}
+function parseTime(s) {
+  const m = TIME_RE.exec(s);
+  if (!m || +m[1] > 23 || +m[2] > 59 || +(m[3] || 0) > 59) return null;
+  return +m[1] * 3600 + +m[2] * 60 + +(m[3] || 0);
+}
+const parseBool = s => (/^(\[[xX✓]\]|true|✓|✔|☑)$/i.test(s) ? true : /^(\[ ?\]|false|☐)$/i.test(s) ? false : null);
+const IMG_CELL_RE = /^!\[([^\]]*)\]\(([^)\s]+)\)$/;
+const LINK_CELL_RE = /^\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)$/;
+
+// 按数字格式解析（旧格或继承来的格式）：成功返回值，失败返回 null
+function parseByFmt(text, fmt, oldV) {
+  const { name } = fmt;
+  if (name >= 6 && name <= 8) {
+    const d = parseDate(text);
+    if (d) return d.v;
+    const t = parseTime(text);
+    if (t === null) return null;
+    return (typeof oldV === 'number' ? Math.floor(oldV / 86400) * 86400 : 0) + t; // 只写了时间就保留原来的日期
+  }
+  if (name === 4) { const p = parsePct(text); return p ? p.v : parseNum(text); }
+  if (name === 3 || name === 5) return parseNum(fmt.s && text.startsWith(fmt.s) ? text.slice(fmt.s.length) : text);
+  return null;
+}
+
+// 没有旧格可参照时按文字推断类型：勾选框、图片、链接、百分比、日期、数字，其余是文字（公式在调用方处理）
+function inferValue(text) {
+  if (/^\[[ xX]\]$/.test(text)) return { v: { class: 'checkbox', value: text !== '[ ]' } };
+  let m = IMG_CELL_RE.exec(text);
+  if (m && /^https?:\/\//i.test(m[2])) return { v: { class: 'image', src: m[2], name: m[1] || '' } };
+  if ((m = LINK_CELL_RE.exec(text))) return { v: { class: 'link', text: m[1] || m[2], url: m[2] } };
+  const p = parsePct(text);
+  if (p) return { v: p.v, tok: `n4_d${p.d}` };
+  const d = parseDate(text);
+  if (d) return { v: d.v, tok: d.tok };
+  const n = parseNum(text);
+  if (n !== null) return { v: n };
+  return { v: text };
+}
+
+// vStore 整份保留，新格式追加到末尾（已有的复用下标）
+function typeIndex(vStore, tok) {
+  if (!Array.isArray(vStore.type)) vStore.type = [];
+  let i = vStore.type.indexOf(tok);
+  if (i < 0) { i = vStore.type.length; vStore.type.push(tok); }
+  return i;
+}
+
+// 生成单元格。base 是同位置的旧格（own = true），或插入行继承样式的上一行同列格（own = false），可以为空。
+// 返回 null 表示不写这一格。st 收集预览里的警告计数
+function buildCell(md, base, own, vStore, st, addr) {
+  const text = mdCellText(md);
+  if (!text) return null;
+  const types = vStore.type || [];
+  const bv = base ? base.v : undefined;
+  const cls = bv && typeof bv === 'object' ? bv.class : null;
+  const fmt = parseFmt(base && base.t !== undefined ? types[base.t] : '');
+  const cell = {};
+  if (base && own) {
+    for (const [k, x] of Object.entries(base)) if (!['v', 't', 'r'].includes(k)) cell[k] = x;
+    if (base.r) st.richLost++;
+  } else if (base && base.s !== undefined) cell.s = base.s;
+  const keepT = () => { if (base && base.t !== undefined) cell.t = base.t; };
+  if (/^=./s.test(text)) {
+    cell.v = { class: 'formula', formula: text.slice(1), value: '' };
+    keepT();
+    return cell;
+  }
+  if (own && cls === 'formula') st.formulaToValue++;
+  if (cls === 'link' && own) {
+    const m = LINK_CELL_RE.exec(text);
+    cell.v = m ? { ...bv, text: m[1] || m[2], url: m[2] } : text;
+    return cell;
+  }
+  if (cls === 'select') {
+    const vals = text.split('、').map(s => s.trim()).filter(Boolean);
+    const opts = new Set((bv.options || []).map(o => o && o.value));
+    if (vals.every(x => opts.has(x)) && (bv.multi || vals.length <= 1)) {
+      cell.v = { ...bv, value: vals };
+      if (own) keepT();
+      return cell;
+    }
+    if (own) { st.selectBad.push(`${addr}「${text}」`); cell.v = text; return cell; }
+  }
+  if (cls === 'checkbox') {
+    const b = parseBool(text);
+    if (b !== null) { cell.v = { ...bv, value: b }; return cell; }
+    if (own) { cell.v = text; return cell; }
+  }
+  if (cls === 'image' && own) {
+    const m = IMG_CELL_RE.exec(text);
+    if (m && /^https?:\/\//i.test(m[2])) { cell.v = { class: 'image', src: m[2], name: m[1] || '' }; return cell; }
+  }
+  if (fmt.name >= 3 && fmt.name <= 8) {
+    const v = parseByFmt(text, fmt, bv);
+    if (v !== null) { cell.v = v; keepT(); return cell; }
+    if (own) { cell.v = text; return cell; } // 不是这种格式的值：按文字写入，去掉格式
+  }
+  if (fmt.name === 2) { cell.v = text; keepT(); return cell; } // 文本格式
+  const g = inferValue(text);
+  cell.v = g.v;
+  if (g.tok) cell.t = typeIndex(vStore, g.tok);
+  else if (own && fmt.name === 1 && typeof g.v === 'number') keepT();
+  return cell;
+}
+
+const colName = c => { let s = ''; for (c++; c > 0; c = Math.floor((c - 1) / 26)) s = String.fromCharCode(65 + ((c - 1) % 26)) + s; return s; };
+const isFormula = cell => !!(cell && cell.v && typeof cell.v === 'object' && cell.v.class === 'formula');
+const clip = s => { s = mdCellText(s).replace(/\n/g, ' '); return s.length > 30 ? s.slice(0, 30) + '…' : s; };
+
+// 合并一个工作表。sh 会被改写（调用方传入副本）。hasFormula：本表有公式，或别的表的公式引用了本表。
+// 返回改动统计；stat.map 是旧行号到新行号的映射，供 calcChain 平移
+function mergeSheet(sh, mdRows, hasFormula) {
+  const name = sh.name || '未命名工作表';
+  const old = sheetGrid(sh);
+  const a = old.cols.length;
+  let b = 0;
+  for (const r of mdRows) { let w = r.length; while (w && !r[w - 1]) w--; b = Math.max(b, w); }
+  const st = { name, changed: 0, inserted: 0, deleted: 0, oldCols: a, newCols: b, clearedCols: Math.max(0, a - b), formulaToValue: 0, mergesDropped: 0, selectBad: [], richLost: 0, filterDropped: false, misplace: [], samples: [], formulas: [], map: R => R };
+  if (!b) {
+    if (old.rows.length) throw new UserError(`工作表「${name}」在文件里没有内容。不支持用空表格清空工作表，请到网页上操作。`);
+    return st; // 原来就是空的，保持不变
+  }
+  const rows = mdRows.map(r => Array.from({ length: b }, (_, j) => r[j] || ''));
+  const k = Math.min(a, b);
+  const key = r => r.slice(0, k).join('\u0001');
+  const { ops, del } = alignRows(old.text.map(key), rows.map(key));
+  const map = rowMapper(old.rows, ops, del);
+  st.map = map;
+  st.inserted = ops.filter(o => o.type === 'ins').length;
+  st.deleted = del.length;
+  const structural = st.inserted > 0 || st.deleted > 0 || a !== b;
+  if (hasFormula && structural) throw new UserError(`工作表「${name}」里有公式（或被其他工作表的公式引用），只支持修改单元格内容，不支持增删行或改变列数。`);
+  for (const d of del) if (st.samples.length < 6) st.samples.push(`删除第 ${old.rows[d] + 1} 行：${old.text[d].filter(Boolean).map(clip).join(' | ')}`);
+
+  if (!sh.vStore || typeof sh.vStore !== 'object') sh.vStore = {};
+  const vStore = sh.vStore;
+  const types = () => vStore.type || [];
+  const colOf = j => (j < a ? old.cols[j] : (a ? old.cols[a - 1] : -1) + 1 + (j - a));
+  // data 整体平移（包括没有文字、只有样式或行高的行）
+  const data = {};
+  for (const [rk, line] of Object.entries(sh.data || {})) {
+    const nr = map(Number(rk));
+    if (nr !== null && line) data[nr] = { ...line };
+  }
+  let lastKept = null;
+  for (const op of ops) {
+    if (op.type === 'ins') {
+      const nr = op.row;
+      const line = data[nr] = {};
+      // 样式、格式从上一行（匹配或配对的旧行，表头行除外）同列继承
+      const from = lastKept && lastKept.o > 0 ? data[map(old.rows[lastKept.o])] || {} : {};
+      for (let j = 0; j < b; j++) {
+        const C = colOf(j);
+        const cell = buildCell(rows[op.n][j], from[C], false, vStore, st, `${colName(C)}${nr + 1}`);
+        if (cell) line[C] = cell;
+      }
+      if (!Object.keys(line).length) delete data[nr];
+      if (st.samples.length < 6) st.samples.push(`新增第 ${nr + 1} 行：${rows[op.n].filter(Boolean).map(clip).join(' | ')}`);
+      continue;
+    }
+    lastKept = op;
+    const nr = map(old.rows[op.o]);
+    const line = data[nr] || (data[nr] = {});
+    for (let j = 0; j < Math.max(a, b); j++) {
+      const C = j < b ? colOf(j) : old.cols[j];
+      const oldCell = line[C];
+      const oldMd = oldCell ? escCell(cellText(oldCell, types()).trim()) : '';
+      const newMd = j < b ? rows[op.n][j] : '';
+      if (newMd === oldMd) continue; // 文字没变：原样保留旧单元格
+      st.changed++;
+      const cell = buildCell(newMd, oldCell, true, vStore, st, `${colName(C)}${nr + 1}`);
+      if (!cell && isFormula(oldCell)) st.formulaToValue++;
+      if (cell) line[C] = cell; else delete line[C];
+      if (st.samples.length < 6) st.samples.push(`${colName(C)}${nr + 1}：「${clip(oldMd)}」→「${clip(newMd)}」`);
+    }
+    if (!Object.keys(line).length) delete data[nr];
+  }
+  sh.data = data;
+
+  if (structural || st.changed) {
+    // 合并单元格：所在行被删除、或中间插入了行就取消；被盖住的格写进了文字也取消，否则文字看不见
+    const merges = {};
+    for (const mc of Object.values(sh.mergeCells || {})) {
+      if (!mc || typeof mc.row !== 'number') continue;
+      const first = map(mc.row);
+      let ok = first !== null;
+      for (let i = 1; ok && i < (mc.rowCount || 1); i++) ok = map(mc.row + i) === first + i;
+      for (let r = 0; ok && r < (mc.rowCount || 1); r++) {
+        for (let c = 0; ok && c < (mc.colCount || 1); c++) {
+          if (r || c) ok = !cellText((data[first + r] || {})[mc.col + c], types()).trim();
+        }
+      }
+      if (ok) merges[`${first}:${mc.col}`] = { ...mc, row: first };
+      else st.mergesDropped++;
+    }
+    sh.mergeCells = merges;
+  }
+  if (structural) {
+    const meta = {};
+    for (const [rk, v] of Object.entries(sh.rows || {})) {
+      const nr = map(Number(rk));
+      if (nr !== null) meta[nr] = v;
+    }
+    sh.rows = meta;
+    const fr = sh.filter && sh.filter.range;
+    if (fr && typeof fr.row === 'number') {
+      const end = fr.row + (fr.rowCount || 1) - 1;
+      let ok = map(fr.row) !== null;
+      for (let r = fr.row + 1; ok && r <= end; r++) ok = map(r) !== null && map(r) === map(r - 1) + 1;
+      if (ok) sh.filter = { ...sh.filter, range: { ...fr, row: map(fr.row) } };
+      else {
+        // 取消筛选，同时让被筛掉的行重新显示
+        sh.filter = {};
+        st.filterDropped = true;
+        for (const v of Object.values(sh.rows)) if (v && typeof v === 'object') { delete v.filter; delete v.filteredBy; delete v.filteredByCols; }
+      }
+    }
+    if (st.inserted || st.deleted) {
+      for (const f of ['frozenRow', 'frozenCol', 'conditionalFormattings', 'protectSelections', 'personal']) {
+        const v = sh[f];
+        if (v && (typeof v !== 'object' || Object.keys(v).length)) st.misplace.push(f);
+      }
+    }
+  }
+  // 行列数要覆盖所有数据，超出范围的单元格编辑器加载时会丢掉
+  let maxR = -1, maxC = -1;
+  for (const [rk, line] of Object.entries(sh.data)) {
+    maxR = Math.max(maxR, Number(rk));
+    for (const ck of Object.keys(line)) maxC = Math.max(maxC, Number(ck));
+  }
+  for (const rk of Object.keys(sh.rows || {})) maxR = Math.max(maxR, Number(rk));
+  for (const mc of Object.values(sh.mergeCells || {})) {
+    if (!mc || typeof mc.row !== 'number') continue;
+    maxR = Math.max(maxR, mc.row + (mc.rowCount || 1) - 1);
+    maxC = Math.max(maxC, mc.col + (mc.colCount || 1) - 1);
+  }
+  sh.rowCount = Math.max(sh.rowCount || 0, maxR + 1);
+  sh.colCount = Math.max(sh.colCount || 0, maxC + 1);
+  for (const [rk, line] of Object.entries(sh.data)) for (const [ck, cell] of Object.entries(line)) if (isFormula(cell)) st.formulas.push([Number(rk), Number(ck)]);
+  return st;
+}
+
+const sheetFormulas = sh => {
+  const out = [];
+  for (const line of Object.values(sh.data || {})) for (const cell of Object.values(line || {})) if (isFormula(cell)) out.push(String(cell.v.formula || ''));
+  return out;
+};
+// 新建后从没写过的表正文是空字符串，用最小模板从零生成（键顺序同网页编辑器）
+const blankSheet = () => ({ name: 'Sheet1', index: 0, rowCount: 200, colCount: 26, data: {}, rows: {}, columns: {}, mergeCells: {}, filter: {}, vStore: {} });
+const blankOuter = () => ({ format: 'lakesheet', version: '3.5.5', larkJson: true, sheet: '', calcChain: [], vessels: {}, useUTC: true, useIndex: true, customColors: [], meta: { sort: 0, shareFilter: 0 }, formulaCalclated: true, versionId: '' });
+const randomStr = (n, abc) => Array.from(crypto.randomBytes(n), b => abc[b % abc.length]).join('');
+const ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+
+// 在当前正文（body_draft）上合并整份 Markdown。返回 { results, untouched, changed, next（新正文，没变化时为 null）, vessels }
+function mergeWorkbook(bodyDraft, md) {
+  let outer = null, sheets = [blankSheet()];
+  if (bodyDraft) {
+    try {
+      outer = JSON.parse(bodyDraft);
+      if (outer.sheet) sheets = unpackSheets(outer.sheet);
+    } catch { throw new UserError('语雀上这张表格的内容解不开，暂不支持修改，请到网页上检查。'); }
+    if (!Array.isArray(sheets) || !sheets.length) sheets = [blankSheet()];
+  }
+  const plan = matchSections(parseMdTables(md), sheets);
+  const work = JSON.parse(JSON.stringify(sheets));
+  const names = sheets.map(sh => sh.name || '未命名工作表');
+  const formulasOf = sheets.map(sheetFormulas);
+  const results = [];
+  for (const { idx, rows } of plan) {
+    const nm = names[idx];
+    const refs = formulasOf.some((list, i) => i !== idx && list.some(f => f.includes(`${nm}!`) || f.includes(`'${nm}'!`)));
+    const st = mergeSheet(work[idx], rows, formulasOf[idx].length > 0 || refs);
+    st.idx = idx;
+    results.push(st);
+  }
+  const touched = new Set(plan.map(p => p.idx));
+  const untouched = names.filter((_, i) => !touched.has(i));
+  const changed = results.some(r => r.changed || r.inserted || r.deleted);
+  const vessels = !!(outer && outer.vessels && typeof outer.vessels === 'object' && Object.keys(outer.vessels).length);
+  if (!changed) return { results, untouched, changed, next: null, vessels };
+
+  // calcChain：平移改过的工作表里的条目，去掉不再是公式的，补上新写的公式
+  const base = outer || blankOuter();
+  let chain = (Array.isArray(base.calcChain) ? base.calcChain : []).map(e => (Array.isArray(e) ? [...e] : e));
+  for (const r of results) {
+    const si = typeof work[r.idx].index === 'number' ? work[r.idx].index : r.idx;
+    const has = new Set();
+    chain = chain.filter(e => {
+      if (!Array.isArray(e) || e[2] !== si) return true;
+      const nr = r.map(e[0]);
+      if (nr === null || !isFormula((work[r.idx].data[nr] || {})[e[1]])) return false;
+      e[0] = nr;
+      has.add(`${nr}:${e[1]}`);
+      return true;
+    });
+    for (const [row, col] of r.formulas) if (!has.has(`${row}:${col}`)) chain.push([row, col, si]);
+  }
+  const sheet = packSheets(work);
+  // 写前自检：解开后必须和要写的工作表完全一致
+  if (JSON.stringify(unpackSheets(sheet)) !== JSON.stringify(work)) throw new Error('表格编码自检失败，已停止');
+  const anyFormula = work.some(sh => sheetFormulas(sh).length);
+  const next = { ...base, sheet, calcChain: chain, ...(anyFormula ? { formulaCalclated: false } : {}), versionId: randomStr(16, ALNUM) };
+  return { results, untouched, changed, next: JSON.stringify(next), vessels };
+}
+
+async function editSheet(args, { book, doc, url, abilities }, abs) {
+  let md = fs.readFileSync(abs, 'utf8').replace(/^﻿/, '');
+  const base = [...md.matchAll(META_RE)].find(m => m[1] && m[2].split(/[?#]/)[0].endsWith(`/${book.docSlug}`));
+  md = md.replace(META_RE, '').replace(ATT_NOTE_RE, '');
+  const h1 = /^\s*#\s+(.+?)\s*#*\s*(\r?\n|$)/.exec(md);
+  const title = String(args.title || (h1 && h1[1]) || doc.title).trim();
+  if (h1 && h1[1].trim() === title) md = md.slice(h1[0].length);
+
+  // 写前检查：编辑权限、协同模式、有没有人正在编辑
+  const editUrl = `https://${book.host}/api/docs/${encodeURIComponent(book.docSlug)}?book_id=${book.id}&merge_dynamic_data=false&mode=edit`;
+  const lockUrl = `https://${book.host}/api/docs/${doc.id}/lock`;
+  const e = (await yq(editUrl)).data || {};
+  const lock = (((await yq(lockUrl)).data || {}).doc) || {};
+  const app = getAppData(await yq(`https://${book.host}/${book.login}/${book.slug}/${encodeURIComponent(book.docSlug)}/edit`));
+  const editType = app && app.matchCondition && app.matchCondition.editType;
+  const me = (app && app.me) || {};
+  const who = x => String((x && x.name) || '').trim() || '其他人';
+  if (!(e.abilities || abilities).update) throw new UserError(`没有「${doc.title}」的编辑权限：${url}`);
+  if (!editType) throw new UserError('没能确认这张表的编辑模式（语雀页面可能改版了），为安全起见暂不修改。');
+  if (/collab/i.test(editType)) throw new UserError('这张表是协同编辑模式，暂不支持脚本修改，请到语雀网页上改。');
+  const members = Array.isArray(lock.collab_members) ? lock.collab_members : [];
+  if (members.length) throw new UserError(`${members.map(who).join('、')} 正在编辑这张表，请等对方关闭编辑页后再改。`);
+  const locker = lock.locker || e.locker;
+  if (locker && locker.id !== me.id) throw new UserError(`${who(locker)} 正在编辑这张表，请等对方关闭编辑页后再改。`);
+
+  const locals = scanLocalFiles(md, path.dirname(abs));
+  const imgs = locals.filter(f => f.kind === 'image' && f.exists);
+  const m1 = mergeWorkbook(e.body_draft || '', md);
+  const remoteAt = bj(e.content_updated_at || doc.content_updated_at || doc.updated_at);
+  const editor = (e.last_editor || doc.last_editor || {}).name;
+  const titleChanged = title !== doc.title;
+
+  console.log('修改预览（表格）：');
+  console.log(`  文档：${doc.title}  ${url}`);
+  console.log(`  知识库：${book.name}`);
+  console.log(`  语雀上最后修改：${remoteAt}${editor ? `（${editor.trim()}）` : ''}${e.status === 0 ? '；这张表目前是草稿，修改后会发布' : ''}`);
+  console.log(`  标题：${titleChanged ? `「${doc.title}」→「${title}」` : '不变'}`);
+  if (!m1.changed && !titleChanged) {
+    console.log('\n没有变化：文件里的表格和语雀上现在的内容一致，不需要写入。');
+    return;
+  }
+  const warns = [];
+  if (!m1.changed) console.log('  表格内容：不变');
+  for (const r of m1.changed ? m1.results : []) {
+    console.log(`  工作表「${r.name}」：改动 ${r.changed} 格，新增 ${r.inserted} 行，删除 ${r.deleted} 行，列数 ${r.oldCols}→${r.newCols}${r.clearedCols ? `，将清空 ${r.clearedCols} 列` : ''}`);
+    for (const s of r.samples) console.log(`    · ${s}`);
+    if (r.changed + r.inserted + r.deleted > r.samples.length && r.samples.length) console.log('    · ……');
+    const tag = m1.results.length > 1 ? `「${r.name}」` : '';
+    if (r.formulaToValue) warns.push(`${tag}公式被改成固定值或清空：${r.formulaToValue} 个`);
+    if (r.mergesDropped) warns.push(`${tag}将取消的合并单元格：${r.mergesDropped} 个（所在行被删除、中间插入了行，或被合并盖住的格写了文字）`);
+    if (r.selectBad.length) warns.push(`${tag}下拉选项里没有的值，按普通文字写入：${r.selectBad.slice(0, 5).join('、')}${r.selectBad.length > 5 ? ' 等' : ''}`);
+    if (r.richLost) warns.push(`${tag}部分文字单独设置的格式（富文本）会丢失：${r.richLost} 格`);
+    if (r.filterDropped) warns.push(`${tag}筛选范围被增删行打断，将取消筛选`);
+    if (r.misplace.length) warns.push(`${tag}行结构有变化，${r.misplace.join('、')} 不会跟着调整，可能错位`);
+  }
+  if (m1.vessels && m1.results.some(r => r.inserted || r.deleted)) warns.push('表格里有浮动图片或图表，增删行后可能错位');
+  if (m1.untouched.length) warns.push(`未在文件中出现、保持不变的工作表：${m1.untouched.join('、')}`);
+  const badLocals = locals.filter(f => f.kind === 'attachment' || !f.exists);
+  if (badLocals.length) warns.push(`表格不支持本地附件，找不到的本地图片也写不进去，按普通文字处理：${badLocals.map(f => f.ref).join('、')}`);
+  for (const w of warns) console.log(`  ⚠ ${w}`);
+  if (imgs.length) console.log(`  本地图片 ${imgs.length} 张，确认后上传`);
+  const stale = !!(base && base[1] < remoteAt);
+  if (stale) console.log(`  ⚠ 你的底稿是 ${base[1]} 的版本，之后语雀上又被改过（${remoteAt}）。表格按单元格合并写回，必须先重新读取最新内容再改。`);
+  else if (!base) console.log('  ⚠ 文件里没有 read 输出的「原文」说明行，无法确认语雀上在你读取之后有没有被改过。');
+  if (locker) console.log('  注意：你自己正在网页上编辑这张表（或之前没正常退出）。写入后网页编辑页会提示版本冲突，请先关掉编辑页。');
+  console.log('  提醒：只改文字有变化的单元格，其余单元格的样式、下拉、链接、公式原样保留；语雀保留历史版本，改错了可以在「历史版本」里恢复。');
+  if (!args.yes) {
+    console.log('\n这是预览，还没有写入。请把预览给用户看，用户明确确认后加 --yes 再运行一次。');
+    return;
+  }
+  if (stale) throw new UserError(`没有写入：底稿是 ${base[1]} 的版本，语雀上之后又被改过（${remoteAt}）。请重新 read 最新内容，在它的基础上修改后再试。`);
+
+  if (imgs.length) md = await uploadLocals(book, doc.id, md, imgs);
+  const uuid = randomStr(10, 'abcdefghijklmnopqrstuvwxyz');
+  try {
+    await yq(lockUrl, { method: 'PUT', json: { uuid } });
+  } catch (err) {
+    if (err instanceof LoginError) throw err;
+    throw new UserError(`没能锁定这张表（${err.message}），可能有人刚打开了编辑页，请稍后再试。没有写入任何内容。`);
+  }
+  let backup = null, synced = true, wrote = false;
+  try {
+    // 加锁后重新读取最新内容，在它上面重新合并
+    const e2 = (await yq(editUrl)).data || {};
+    if (e2.locker && e2.locker.uuid && e2.locker.uuid !== uuid) throw new UserError('加锁后发现有人同时在编辑这张表，已放弃写入。');
+    const m2 = mergeWorkbook(e2.body_draft || '', md);
+    if (m2.changed) {
+      const next = m2.next;
+      if (Buffer.byteLength(next, 'utf8') > 5 * 1048576) throw new UserError('修改后的表格超过 5 MB，语雀网页端也存不了，已放弃写入。');
+      // 写入前的正文留一份在本机（新建后没写过的空表不用备份）
+      if (e2.body_draft) {
+        const dir = path.join(os.tmpdir(), 'li-yuque-skills', 'backup');
+        fs.mkdirSync(dir, { recursive: true });
+        const d = new Date();
+        const stamp = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+        backup = path.join(dir, `${safeName(`${book.slug}-${book.docSlug}`)}-${stamp}.json`);
+        fs.writeFileSync(backup, e2.body_draft);
+      }
+      const dv = e2.draft_version || 0;
+      await yq(`https://${book.host}/api/docs/${doc.id}/content`, {
+        method: 'PUT',
+        json: { format: 'lakesheet', body_asl: next, body_html: null, draft_version: dv, ...(dv ? {} : { _without_draft_version: 1 }), sync_dynamic_data: false, save_type: 'user', edit_type: 'Lake', created_by: 'online' },
+      });
+      wrote = true;
+      let a = (await yq(editUrl)).data || {};
+      if (a.body_draft !== next) throw new UserError(`写入后回读的内容和发出的不一致，请到网页上检查这张表：${url}${backup ? `\n写入前的内容已备份到：${backup}` : ''}`);
+      // 知识库没开自动发布时，内容只进了草稿，要再发布一次
+      if (a.status !== 1 || a.body !== a.body_draft) {
+        try {
+          await yq(`https://${book.host}/api/docs/${doc.id}/publish`, { method: 'PUT', json: { format: 'lakesheet', notify: false, force: true } });
+          a = (await yq(editUrl)).data || {};
+        } catch (err) { if (err instanceof LoginError) throw err; }
+        synced = a.status === 1 && a.body === next && a.body_draft === next;
+      }
+    }
+    if (titleChanged) {
+      try {
+        await yq(`https://${book.host}/api/docs/${doc.id}/meta`, { method: 'PUT', json: { title } });
+      } catch (err) {
+        if (err instanceof LoginError) throw err;
+        console.log(`\n注意：${wrote ? '内容已修改，但' : ''}标题没改成功（${err.message}），可以到网页上改。`);
+      }
+    }
+  } finally {
+    try { await yq(`${lockUrl}?uuid=${uuid}`, { method: 'DELETE' }); } catch { console.log('\n注意：释放编辑锁失败，一段时间后会自动失效；期间在网页上打开编辑可能提示有人在编辑。'); }
+  }
+  console.log(`\n已修改：${title}\n链接：${url}`);
+  if (backup) console.log(`写入前的内容已备份到：${backup}`);
+  console.log('语雀保留历史版本，改错了可以在网页「历史版本」里恢复。');
+  if (!synced) console.log(`注意：新内容已保存为草稿，但没能发布。请到网页上打开这张表点「发布」：${url}`);
+}
+
+// ---------- 命令：delete（只删自己创建、且没有子文档的文档或表格） ----------
 async function cmdDelete(args) {
   const link = args._[1];
-  if (!link || args._.length > 2) throw new UserError('用法：delete <文档链接> [--yes]（一次只能删一篇）');
+  if (!link || args._.length > 2) throw new UserError('用法：delete <文档或表格链接> [--yes]（一次只能删一篇）');
   const { book, doc, url, abilities } = await loadDocByLink(link);
   const me = await whoami();
   const owner = (doc.user && doc.user.name || '').trim() || '别人';
@@ -1028,7 +1651,7 @@ async function cmdDelete(args) {
   console.log(`  文档：${doc.title}  ${url}`);
   console.log(`  知识库：${book.name}`);
   console.log(`  创建：${bj(doc.created_at)}（${String(me.name || '').trim()}，本人）；最后修改：${bj(doc.content_updated_at || doc.updated_at)}（${(editor.name || '').trim() || '未知'}）`);
-  console.log(`  正文约 ${doc.word_count || 0} 字`);
+  console.log(String(doc.type).toLowerCase() === 'sheet' ? '  类型：表格' : `  正文约 ${doc.word_count || 0} 字`);
   if (editor.id && editor.id !== me.id) console.log('  注意：最后修改人不是你，删除会连同他人的修改一起删掉。');
   console.log('  删除后进入知识库的「回收站」，可以在语雀网页上恢复。');
   if (!args.yes) {
@@ -1294,9 +1917,10 @@ const HELP = `li-yuque-skills ${VERSION}：语雀文档读取、下载、新建�
                               下载为 Markdown（表格转成 Markdown 表格），图片存到同目录 img/，附件存到 files/（默认单个不超过 ${DEFAULT_MAX_MB} MB）
   add  <md文件> --book <知识库名或链接> [--under 目录/子目录] [--title 标题] [--yes]
                               新建文档；不加 --yes 只预览不写入
-  edit <文档链接> <md文件> [--title 标题] [--yes]
-                              用本地 Markdown 替换文档全文（需有编辑权限）；不加 --yes 只预览
-  delete <文档链接> [--yes]    删除自己创建、且没有子文档的文档（进回收站）；不加 --yes 只预览
+  edit <文档或表格链接> <md文件> [--title 标题] [--yes]
+                              用本地 Markdown 替换文档全文；表格按 read 输出的 Markdown 表格逐格合并写回（需有编辑权限）；不加 --yes 只预览
+  delete <文档或表格链接> [--yes]
+                              删除自己创建、且没有子文档的文档或表格（进回收站）；不加 --yes 只预览
 
 cookie 位置：${COOKIE_FILE}`;
 

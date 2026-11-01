@@ -38,8 +38,8 @@ Talk to your agent:
 - **Read a link**: paste one or more document or spreadsheet links; the agent reads them and answers directly, and can open the images and attachments (HTML prototypes, PDFs, etc.) too.
 - **Download**: spreadsheets become Markdown tables, images go to `img/` and attachments to `files/`; attachments over 50 MB are skipped by default, and the agent can raise the limit.
 - **Create**: the agent shows a preview (knowledge base, folder, title) and publishes only after you confirm.
-- **Edit**: works on any document you can edit (yours or your teammates'). The agent reads the latest version first and replaces the whole body; styles Markdown can't express (font colors, cards, etc.) are lost. Yuque keeps version history, so mistakes can be rolled back.
-- **Delete**: only documents you created and that have no child documents. Deleted documents go to the knowledge base's recycle bin and can be restored.
+- **Edit**: works on any document you can edit (yours or your teammates'). The agent reads the latest version first and replaces the whole body; styles Markdown can't express (font colors, cards, etc.) are lost. Yuque keeps version history, so mistakes can be rolled back. **Spreadsheets** can be edited too: changes are merged cell by cell, so untouched cells keep their styles, dropdowns and formulas; rows can be added or removed (content-only edits when the sheet has formulas); edits are refused while someone else has the sheet open for editing.
+- **Delete**: only documents or spreadsheets you created and that have no child documents. Deleted documents go to the knowledge base's recycle bin and can be restored.
 
 ## Notes
 
