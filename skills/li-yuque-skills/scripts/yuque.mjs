@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// li-yuque-skills：读取、搜索、下载语雀文档，新建、修改文档和表格，删除自己创建的文档。零依赖，需要 Node 18 及以上。
+// li-yuque-skills：读取、搜索、下载语雀文档，读取评论，新建、修改文档和表格，删除自己创建的文档。零依赖，需要 Node 18 及以上。
 // 安全约定：
 //   1. 写操作只有新建、修改、删除三种；删除只允许删本人创建、且没有子文档的文档。
 //   2. 写操作都先预览，用户确认后带 --yes 才执行；访问范围只受账号自身权限约束。
@@ -16,7 +16,7 @@ import { pipeline } from 'node:stream/promises';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.9.0';
+const VERSION = '0.10.0';
 // 更新来源：GitHub 原始文件优先，访问不了时用 jsDelivr 镜像（可能滞后几小时）
 const REPO = 'xiaoli1999/li-yuque-skills';
 const BRANCH = 'master';
@@ -589,6 +589,18 @@ function writeConfig(patch) {
 }
 
 // ---------- 命令：books / toc ----------
+// 能访问的空间：语雀主站 + 各企业空间（xxx.yuque.com）
+async function listHosts() {
+  const hosts = [{ host: 'www.yuque.com', label: '语雀', name: '语雀' }];
+  for (const o of (await yq('https://www.yuque.com/api/mine/organizations')).data || []) {
+    try {
+      const h = new URL(o.host).hostname;
+      if (HOST_RE.test(h) && h !== 'www.yuque.com') hosts.push({ host: h, label: `${o.name}（${h}）`, name: o.name });
+    } catch { /* 跳过无效地址 */ }
+  }
+  return hosts;
+}
+
 // 列出能访问的知识库：我的 + 语雀主站团队 + 各企业空间（xxx.yuque.com）团队
 async function listAllBooks() {
   const isBook = b => String(b.type || 'Book') === 'Book' && b.slug;
@@ -596,13 +608,7 @@ async function listAllBooks() {
   const mine = ((await yq('https://www.yuque.com/api/mine/books?limit=100&offset=0')).data || []).filter(isBook);
   for (const b of mine) out.push({ name: b.name, url: `https://www.yuque.com/${(b.user && b.user.login) || ''}/${b.slug}`, group: '我的知识库' });
 
-  const hosts = [{ host: 'www.yuque.com', label: '语雀' }];
-  for (const o of (await yq('https://www.yuque.com/api/mine/organizations')).data || []) {
-    try {
-      const h = new URL(o.host).hostname;
-      if (HOST_RE.test(h) && h !== 'www.yuque.com') hosts.push({ host: h, label: `${o.name}（${h}）` });
-    } catch { /* 跳过无效地址 */ }
-  }
+  const hosts = await listHosts();
   const failed = [];
   for (const { host, label } of hosts) {
     let groups = [];
@@ -673,9 +679,11 @@ function matchScore(query, title, fullPath) {
 }
 
 async function cmdSearch(args) {
-  const query = args._.slice(1).join(' ').trim();
-  if (!query) throw new UserError('用法：search <关键词> [--book 知识库名或链接] [--limit 条数]');
+  // 写成「search --body 关键词」时，关键词会被当成 --body 的值
+  const query = [...args._.slice(1), ...(typeof args.body === 'string' ? [args.body] : [])].join(' ').trim();
+  if (!query) throw new UserError('用法：search <关键词> [--body] [--book 知识库名或链接] [--limit 条数]');
   const limit = Number(args.limit) || 20;
+  if (args.body) return searchBody(query, args, limit);
   let targets;
   if (args.book) targets = [{ url: await resolveBookRef(args.book) }];
   else {
@@ -716,6 +724,80 @@ async function cmdSearch(args) {
     else console.log(`  - [目录] ${h.node.title}/\n      位置：${where}\n      下载这个目录：pull ${h.book.url} --dir "${[...(h.dirPath ? h.dirPath.split('/') : []), h.node.title].join('/')}"`);
   }
   if (!hits.length) console.log('  没有匹配的目录或标题。可以换个关键词、减少字数，或用空格分开多个词。');
+  for (const f of failed) console.log(`  （跳过 ${f}）`);
+}
+
+// ---------- 命令：search --body（用语雀自己的搜索按正文内容找） ----------
+// 网页端搜索框的接口，type=doc 搜文档（标题和正文都算），每页 20 条，摘要里命中的词包在 <em> 里。
+// 搜全部：每个空间各搜一次，scope=/、tab=related；限定知识库：scope=<用户或团队>/<知识库>，返回的 info.book 用来确认范围认对了
+const SEARCH_KIND = { Sheet: '表格', Board: '画板', Table: '数据表', Thread: '话题' };
+const stripTags = s => decodeEntities(String(s || '').replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
+const cut = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+
+async function zsearch(host, query, scope, want) {
+  const hits = [], seen = new Set();
+  let total = 0, info = null;
+  for (let page = 1; page <= 50 && hits.length < want; page++) {
+    const q = new URLSearchParams({ q: query, type: 'doc', scope, ...(scope === '/' ? { tab: 'related' } : {}), p: String(page), sence: 'modal' });
+    const d = (await yq(`https://${host}/api/zsearch?${q}`)).data || {};
+    if (!Array.isArray(d.hits)) throw new UserError('语雀搜索接口的返回格式变了，暂时用不了正文搜索。');
+    if (!info) info = d.info || {};
+    total = Number(d.totalHits) || 0;
+    const fresh = d.hits.filter(h => h && !seen.has(h.id));
+    for (const h of fresh) { seen.add(h.id); hits.push(h); }
+    if (!fresh.length || hits.length >= total) break; // 到底了，或者翻页没有新结果
+  }
+  return { hits: hits.slice(0, want), total: Math.max(total, hits.length), info };
+}
+
+async function searchBody(query, args, limit) {
+  limit = Math.min(Math.max(Math.floor(limit), 1), 100);
+  let spaces;
+  if (args.book) {
+    const p = parseYuqueUrl(await resolveBookRef(args.book));
+    spaces = [{ host: p.host, scope: `${p.login}/${p.book}`, label: args.book, name: '' }];
+  } else {
+    spaces = (await listHosts()).map(h => ({ ...h, scope: '/' }));
+    console.log(`在 ${spaces.length} 个空间（${spaces.map(s => s.name).join('、')}）里按正文搜索「${query}」……`);
+  }
+  const lists = [], failed = [];
+  for (const s of spaces) {
+    try {
+      const r = await zsearch(s.host, query, s.scope, limit);
+      if (args.book && !(r.info && r.info.book)) throw new UserError(`语雀没有认出这个知识库：${args.book}（链接不对，或这个账号没有权限）`);
+      lists.push({ ...s, ...r });
+    } catch (e) {
+      if (e instanceof LoginError || args.book) throw e;
+      failed.push(`${s.label}：${e.message}`);
+    }
+  }
+  // 各空间的结果轮流排，每个空间最相关的几条都排在前面
+  const shown = [];
+  for (let i = 0; shown.length < limit && lists.some(l => i < l.hits.length); i++) {
+    for (const l of lists) if (i < l.hits.length && shown.length < limit) shown.push({ h: l.hits[i], space: l });
+  }
+  const total = lists.reduce((n, l) => n + l.total, 0);
+  const many = !args.book && lists.length > 1;
+  const where = args.book ? `知识库「${stripTags(lists[0].info.book.name) || args.book}」里` : '';
+  const per = many ? `（${lists.map(l => `${l.name} ${l.total} 条`).join('，')}）` : '';
+  const head = `${args.book ? '' : '\n'}${where}按正文搜索「${query}」`;
+  if (!shown.length) {
+    console.log(`${head}，没有找到正文或标题含这个词的文档。可以换个说法、减少字数，或用空格分开多个词；刚改过的内容可能要过几分钟才搜得到，表格里的内容不一定能搜到。`);
+    for (const f of failed) console.log(`  （跳过 ${f}）`);
+    return;
+  }
+  console.log(`${head}，找到 ${total} 条${per}${total > shown.length ? `，显示前 ${shown.length} 条` : ''}：`);
+  shown.forEach(({ h, space }, i) => {
+    const r = h._record || {};
+    const kind = SEARCH_KIND[h.type || r.type];
+    let link = '';
+    try { link = new URL(h.url, `https://${space.host}`).href; } catch { /* 没有链接 */ }
+    const abs = cut(stripTags(h.abstract), 120);
+    console.log(`  ${i + 1}. ${stripTags(r.title || h.title) || '（无标题）'}${kind ? `（${kind}）` : ''}`);
+    console.log(`     知识库：${stripTags(h.book_name || (r.book && r.book.name)) || '未知'}${many && space.host !== 'www.yuque.com' ? `（${space.name}）` : ''}`);
+    console.log(`     链接：${link}`);
+    if (abs) console.log(`     摘要：${abs}`);
+  });
   for (const f of failed) console.log(`  （跳过 ${f}）`);
 }
 
@@ -900,9 +982,17 @@ function randomSlug() {
   return Array.from(crypto.randomBytes(16), b => abc[b % abc.length]).join('');
 }
 
+// 标题：--title 优先；否则取开头的一级标题；再否则用 fallback（文件名）。开头的一级标题和标题相同时从正文里去掉，避免重复。
+function takeTitle(md, title, fallback) {
+  const h1 = /^\s*#\s+(.+?)\s*#*\s*(\r?\n|$)/.exec(md);
+  const t = String(title || (h1 && h1[1]) || fallback).trim();
+  return { title: t, md: h1 && h1[1].trim() === t ? md.slice(h1[0].length) : md };
+}
+
 async function cmdAdd(args) {
-  const file = args._[1];
-  if (!file || !args.book) throw new UserError('用法：add <md文件> --book <知识库名或链接> [--under 目录/子目录] [--title 标题] [--yes]');
+  // 写成「add --sheet 文件」时，文件名会被当成 --sheet 的值
+  const file = args._[1] || (typeof args.sheet === 'string' ? args.sheet : undefined);
+  if (!file || !args.book) throw new UserError('用法：add <md文件> --book <知识库名或链接> [--under 目录/子目录] [--title 标题] [--sheet] [--yes]');
   const abs = path.resolve(file);
   if (!fs.existsSync(abs)) throw new UserError(`文件不存在：${abs}`);
   let md = fs.readFileSync(abs, 'utf8').replace(/^﻿/, '');
@@ -911,12 +1001,12 @@ async function cmdAdd(args) {
   const parent = args.under ? findPath(buildTree(book.toc), args.under) : null;
   if (parent && !['TITLE', 'DOC'].includes(parent.type)) throw new UserError(`「${args.under}」不是分组也不是文档，不能放在它下面。`);
 
-  // 标题：--title 优先；否则取开头的一级标题；再否则用文件名。开头的一级标题会从正文里去掉，避免重复。
-  const h1 = /^\s*#\s+(.+?)\s*#*\s*(\r?\n|$)/.exec(md);
-  const title = String(args.title || (h1 && h1[1]) || path.basename(abs, path.extname(abs))).trim();
-  if (h1 && h1[1].trim() === title) md = md.slice(h1[0].length);
+  const picked = takeTitle(md, args.title, path.basename(abs, path.extname(abs)));
+  const title = picked.title;
+  md = picked.md;
 
   const locals = scanLocalFiles(md, path.dirname(abs));
+  if (args.sheet) return addSheet(args, { book, parent, title, md, locals });
 
   console.log('新建预览：');
   console.log(`  知识库：${book.name}  ${book.url}`);
@@ -998,7 +1088,8 @@ const ATT_NOTE_RE = /^>\s*(?:图片|附件)(?:已下载到本机|未下载)：.*
 
 async function cmdEdit(args) {
   const [, link, file] = args._;
-  if (!link || !file) throw new UserError('用法：edit <文档或表格链接> <md文件> [--title 标题] [--yes]');
+  if (link && !file && args.title !== undefined) return editTitle(args, link);
+  if (!link || !file) throw new UserError('用法：edit <文档或表格链接> <md文件> [--title 标题] [--yes]\n只改标题：edit <文档或表格链接> --title 新标题 [--yes]');
   const abs = path.resolve(file);
   if (!fs.existsSync(abs)) throw new UserError(`文件不存在：${abs}`);
   const { book, doc, url, abilities } = await loadDocByLink(link);
@@ -1038,6 +1129,34 @@ async function cmdEdit(args) {
   const synced = await saveDoc(book, book.docSlug, doc.id, title, md, doc.status !== 0, url);
   console.log(`\n已修改：${title}\n链接：${url}`);
   if (!synced) console.log(DRAFT_NOT_SYNCED);
+}
+
+// ---------- 命令：edit --title（不带文件：只改标题，正文不动） ----------
+async function editTitle(args, link) {
+  const title = typeof args.title === 'string' ? args.title.trim() : '';
+  if (!title) throw new UserError('--title 后面写新标题，如：edit <文档链接> --title "新标题"');
+  const { book, doc, url, abilities } = await loadDocByLink(link);
+  if (!abilities.update) throw new UserError(`没有「${doc.title}」的编辑权限：${url}`);
+  const kind = String(doc.type).toLowerCase() === 'sheet' ? '表格' : '文档';
+  if (title === doc.title) {
+    console.log(`标题没有变化：这${kind === '表格' ? '张' : '篇'}${kind}现在就叫「${doc.title}」，不需要修改。\n链接：${url}`);
+    return;
+  }
+  console.log('修改预览（只改标题）：');
+  console.log(`  ${kind}：${doc.title}  ${url}`);
+  console.log(`  知识库：${book.name}`);
+  console.log(`  标题：「${doc.title}」→「${title}」`);
+  // 有未发布修改的已发布文档，status 也是 0（published_at 有值）；只改标题不会发布草稿
+  const draft = doc.status !== 0 ? '' : doc.published_at ? '（这篇有未发布的修改，改标题不会发布它们）' : '（这篇是还没发布过的草稿，改标题不会发布它）';
+  console.log(`  正文：不变${draft}；链接不变`);
+  if (!args.yes) {
+    console.log('\n这是预览，还没有写入。请把预览给用户看，用户明确确认后加 --yes 再运行一次。');
+    return;
+  }
+  await yq(`https://${book.host}/api/docs/${doc.id}/meta`, { method: 'PUT', json: { title } });
+  const now = ((await yq(`https://${book.host}/api/docs/${encodeURIComponent(book.docSlug)}?book_id=${book.id}&merge_dynamic_data=false`)).data || {}).title;
+  if (now !== title) throw new UserError(`语雀返回成功，但回读到的标题是「${now}」，请到网页上检查：${url}`);
+  console.log(`\n已修改标题：${title}\n链接：${url}`);
 }
 
 // 按网页编辑器的顺序保存正文：先以编辑模式打开（不这样做，存草稿会被忽略），再存草稿（同时更新编辑器草稿），需要时再发布。
@@ -1501,6 +1620,113 @@ function mergeWorkbook(bodyDraft, md) {
   return { results, untouched, changed, next: JSON.stringify(next), vessels };
 }
 
+// ---------- 命令：add --sheet（把 Markdown 表格新建成语雀表格） ----------
+// 从零生成整份表格正文：没有「## 工作表名」时只有一个 Sheet1；有就每节一个工作表（重名的加序号），index 从 0 起。
+// 单元格按文字推断类型（同修改表格时新增的行）。返回 { sheets: [{ name, from, rows, cols, formulas }], next（正文 JSON 字符串） }
+function buildWorkbook(md) {
+  const sections = parseMdTables(md);
+  const named = sections.slice(1);
+  let plan;
+  if (!named.length) {
+    if (!sections[0].rows.length) throw new UserError('文件里没有 Markdown 表格（| 开头的行），建不了表格。');
+    plan = [{ name: 'Sheet1', from: null, rows: sections[0].rows }];
+  } else {
+    if (sections[0].rows.length) throw new UserError('第一个「## 工作表名」之前有表格行，请把它放到某个「## 工作表名」下面。');
+    const used = new Set();
+    plan = named.map(s => {
+      if (!s.rows.length) throw new UserError(`「## ${s.name}」下面没有表格行。新建表格时每个「## 标题」是一个工作表，下面要有 Markdown 表格；不是工作表的标题请删掉，或改成「###」。`);
+      let name = s.name;
+      for (let n = 2; used.has(name.toLowerCase()); n++) name = `${s.name} (${n})`;
+      used.add(name.toLowerCase());
+      return { name, from: s.name, rows: s.rows };
+    });
+  }
+  const work = [], chain = [], sheets = [];
+  plan.forEach((p, idx) => {
+    const sh = { ...blankSheet(), name: p.name, index: idx };
+    const rows = p.rows.slice();
+    while (rows.length && rows[rows.length - 1].every(c => !c)) rows.pop();
+    if (!rows.length) throw new UserError(`${p.from === null ? '文件里的表格' : `「## ${p.from}」下面的表格`}是空的。`);
+    let cols = 0, formulas = 0;
+    rows.forEach((r, i) => r.forEach((text, j) => {
+      const cell = buildCell(text, null, false, sh.vStore, { selectBad: [] }, `${colName(j)}${i + 1}`);
+      if (!cell) return;
+      (sh.data[i] || (sh.data[i] = {}))[j] = cell;
+      cols = Math.max(cols, j + 1);
+      if (isFormula(cell)) { formulas++; chain.push([i, j, idx]); }
+    }));
+    sh.rowCount = Math.max(sh.rowCount, rows.length);
+    sh.colCount = Math.max(sh.colCount, cols);
+    work.push(sh);
+    sheets.push({ name: p.name, from: p.from, rows: rows.length, cols, formulas });
+  });
+  const sheet = packSheets(work);
+  // 写前自检：解开后必须和要写的工作表完全一致
+  if (JSON.stringify(unpackSheets(sheet)) !== JSON.stringify(work)) throw new Error('表格编码自检失败，已停止');
+  const next = JSON.stringify({ ...blankOuter(), sheet, calcChain: chain, formulaCalclated: !chain.length, versionId: randomStr(16, ALNUM) });
+  return { sheets, next };
+}
+
+// 新建表格：先建空表（草稿），有本地图片就上传，再一次写入整份内容；知识库没开自动发布时补一次发布
+async function addSheet(args, { book, parent, title, md, locals }) {
+  const imgs = locals.filter(f => f.kind === 'image' && f.exists);
+  const bad = locals.filter(f => f.kind === 'attachment' || !f.exists);
+  const wb = buildWorkbook(md);
+  if (Buffer.byteLength(wb.next, 'utf8') > 5 * 1048576) throw new UserError('生成的表格超过 5 MB，语雀网页端也存不了，请拆成几张表。');
+
+  console.log('新建预览（表格）：');
+  console.log(`  知识库：${book.name}  ${book.url}`);
+  console.log(`  位置：${parent ? `${args.under}（排在最前）` : '根目录（排在最前）'}`);
+  console.log(`  标题：${title}`);
+  for (const s of wb.sheets) {
+    const renamed = s.from !== null && s.from !== s.name ? `（文件里有重名的「${s.from}」，改叫这个名字）` : '';
+    console.log(`  工作表「${s.name}」：${s.rows} 行 × ${s.cols} 列（第一行是表头）${s.formulas ? `，公式 ${s.formulas} 个` : ''}${renamed}`);
+  }
+  console.log(`  本地图片 ${imgs.length} 张${imgs.length ? '，确认后上传' : ''}`);
+  if (bad.length) console.log(`  找不到的本地文件、或表格不支持的本地附件（按普通文字写入）：${bad.map(f => f.ref).join('、')}`);
+  console.log('  提醒：单元格类型按文字推断（数字、百分比、日期、[x] 勾选框、链接、图片、= 开头的公式），不设颜色、粗体等样式。');
+  if (!args.yes) {
+    console.log('\n这是预览，还没有写入。请把预览给用户看，用户明确确认后加 --yes 再运行一次。');
+    return;
+  }
+
+  const created = await yq(`https://${book.host}/api/docs`, {
+    method: 'POST',
+    json: {
+      book_id: book.id, type: 'Sheet', format: 'lakesheet', title, slug: randomSlug(), status: 0,
+      insert_to_catalog: true, action: 'prependChild', target_uuid: parent ? parent.uuid : null,
+    },
+  });
+  const doc = created.data || {};
+  if (!doc.id || !doc.slug) throw new UserError('语雀没有返回新表格信息，请到网页上确认是否已创建。');
+  const docUrl = `${book.url}/${doc.slug}`;
+  const editUrl = `https://${book.host}/api/docs/${encodeURIComponent(doc.slug)}?book_id=${book.id}&merge_dynamic_data=false&mode=edit`;
+  let synced = true;
+  try {
+    // 只写本次刚建的这张
+    const next = imgs.length ? buildWorkbook(await uploadLocals(book, doc.id, md, imgs)).next : wb.next;
+    const dv = doc.draft_version || 0;
+    await yq(`https://${book.host}/api/docs/${doc.id}/content`, {
+      method: 'PUT',
+      json: { format: 'lakesheet', body_asl: next, body_html: null, draft_version: dv, ...(dv ? {} : { _without_draft_version: 1 }), sync_dynamic_data: false, save_type: 'user', edit_type: 'Lake', created_by: 'online' },
+    });
+    let a = (await yq(editUrl)).data || {};
+    if (a.body_draft !== next) throw new Error('写入后回读的内容和发出的不一致');
+    // 知识库没开自动发布时，内容只进了草稿，要再发布一次
+    if (a.status !== 1 || a.body !== a.body_draft) {
+      try {
+        await yq(`https://${book.host}/api/docs/${doc.id}/publish`, { method: 'PUT', json: { format: 'lakesheet', notify: false, force: true } });
+        a = (await yq(editUrl)).data || {};
+      } catch (err) { if (err instanceof LoginError) throw err; }
+      synced = a.status === 1 && a.body === next && a.body_draft === next;
+    }
+  } catch (e) {
+    throw new UserError(`表格已建成草稿，但${imgs.length ? '上传本地图片或' : ''}写入内容时出错：${e.message}\n草稿地址：${docUrl}（可到网页上处理）`);
+  }
+  console.log(`\n已新建：${title}\n链接：${docUrl}`);
+  if (!synced) console.log(`注意：表格内容已保存为草稿，但没能发布。请到网页上打开这张表点「发布」：${docUrl}`);
+}
+
 async function editSheet(args, { book, doc, url, abilities }, abs) {
   let md = fs.readFileSync(abs, 'utf8').replace(/^﻿/, '');
   const base = [...md.matchAll(META_RE)].find(m => m[1] && m[2].split(/[?#]/)[0].endsWith(`/${book.docSlug}`));
@@ -1662,6 +1888,66 @@ async function cmdDelete(args) {
   console.log(`\n已删除：${doc.title}\n已进入「${book.name}」的回收站，需要时可在语雀网页上恢复。`);
 }
 
+// ---------- 命令：comments（读取文档或表格的评论，只读） ----------
+// 网页端评论区用的接口：一次返回全部楼层（网页自己在前端分页），回复在每层的 sub_comments 里；
+// 评论正文 body 是渲染好的 HTML；划词评论的原文在 selection.text（要带 include_section=true 才有）
+
+// 评论 HTML 转纯文本：段落、换行转成换行，链接转 [文字](链接)，图片转 ![](地址)，其余标签去掉，最后统一反转义
+function htmlToText(html) {
+  const attr = (tag, name) => {
+    const m = new RegExp(`\\s${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, 'i').exec(tag);
+    return m ? (m[1] ?? m[2]) : '';
+  };
+  let s = String(html || '').replace(/<!doctype[^>]*>/gi, '').replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, '');
+  s = s.replace(/<img\b[^>]*>/gi, tag => { const src = attr(tag, 'src'); return src ? `![](${src})` : ''; });
+  s = s.replace(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi, (all, attrs, inner) => {
+    const href = attr(attrs, 'href'), text = inner.replace(/<[^>]+>/g, '').trim();
+    if (!/^(https?:|mailto:)/i.test(href)) return text;
+    return !text || text === href ? ` ${href} ` : `[${text}](${href})`; // 裸链接前后留空格，免得和相邻文字粘在一起
+  });
+  s = s.replace(/<br\s*\/?>/gi, '\n').replace(/<li\b[^>]*>/gi, '\n- ').replace(/<\/(p|div|h[1-6]|li|blockquote|pre|tr|ul|ol)>/gi, '\n');
+  return decodeEntities(s.replace(/<[^>]+>/g, '')).split('\n').map(l => l.replace(/[ \t ]+/g, ' ').trim()).filter(Boolean).join('\n');
+}
+
+// 把评论接口返回的楼层整理成 Markdown（纯函数，limit 是最多显示的楼层数）
+function commentsToMd(title, url, data, limit) {
+  const floors = data.comments, meta = data.meta || {};
+  const replies = floors.reduce((n, c) => n + (Array.isArray(c.sub_comments) ? c.sub_comments.length : 0), 0);
+  const total = Number(meta.total) || floors.length + replies;
+  if (!floors.length) return `# ${title}\n\n> 原文：<${url}>\n\n没有评论。`;
+  const who = c => String((c.user && (c.user.name || c.user.login)) || '').trim() || '未知用户';
+  const body = (c, pad) => (c.deleted_at ? '（这条评论已删除）' : htmlToText(c.body) || '（空）').split('\n').map(l => pad + l);
+  const out = [`# ${title}`, '', `> 原文：<${url}> · 评论 ${total} 条（${floors.length} 层${replies ? `，其中回复 ${replies} 条` : ''}）`];
+  for (const c of floors.slice(0, limit)) {
+    out.push('', `- ${who(c)}（${bj(c.created_at)}）`);
+    const sel = c.selection && String(c.selection.text || '').replace(/\s+/g, ' ').trim();
+    if (sel) out.push(`  > 针对：「${sel}」`);
+    out.push(...body(c, '  '));
+    for (const r of Array.isArray(c.sub_comments) ? c.sub_comments : []) {
+      const to = r.to_user && String(r.to_user.name || r.to_user.login || '').trim();
+      out.push(`  - ${who(r)} 回复${to ? ` ${to}` : ''}（${bj(r.created_at)}）`, ...body(r, '    '));
+    }
+  }
+  if (floors.length > limit) out.push('', `> 只显示了前 ${limit} 层，共 ${floors.length} 层；需要时加 --limit ${floors.length} 再看。`);
+  if (meta.hasMore) out.push('', '> 注意：语雀这次只返回了一部分评论，其余请到网页上查看。');
+  return out.join('\n');
+}
+
+async function cmdComments(args) {
+  const link = args._[1];
+  if (!link || args._.length > 2) throw new UserError('用法：comments <文档或表格链接> [--limit 楼层数]');
+  if (!/^https?:\/\//i.test(String(link))) throw new UserError(`需要文档链接（https://...yuque.com/...），收到：${link}。不知道链接时先用 search 找。`);
+  const limit = Math.max(Math.floor(Number(args.limit)) || 50, 1);
+  const book = await loadBook(link);
+  if (!book.docSlug) throw new UserError(`这是知识库链接，不是单篇文档的链接：${link}`);
+  const doc = (await yq(`https://${book.host}/api/docs/${encodeURIComponent(book.docSlug)}?book_id=${book.id}&merge_dynamic_data=false`)).data || {};
+  if (!doc.id) throw new UserError(`打不开这篇文档：${link}`);
+  const q = `commentable_type=Doc&commentable_id=${doc.id}&include_section=true&include_reactions=true&include_to_user=true`;
+  const data = (await yq(`https://${book.host}/api/comments/floor?${q}`)).data || {};
+  if (!Array.isArray(data.comments)) throw new UserError('语雀评论接口的返回格式变了，暂时读不了评论。');
+  console.log(commentsToMd(doc.title, `${book.url}/${book.docSlug}`, data, limit));
+}
+
 // 语雀前端代码里 .zip/.rar/.7z 只对付费账号开放，其余压缩包和 .mjs 也会被拒（2026-10-12 实测）
 const RISKY_EXT = /\.(zip|rar|7z|gz|tgz|gzip|tar|jar|dmg|pkg|mjs)$/i;
 
@@ -1710,6 +1996,7 @@ const LOGIN_STEPS = `登录语雀（cookie 只在剪贴板里交给 AI，不要�
 const SAY_EXAMPLES = `你可以这样对 AI 说：
   · 列出我能访问的语雀知识库
   · 在语雀里找一下标题带「某关键词」的文档
+  · 在语雀里找一下内容里提到「某关键词」的文档
   · 看看「某某知识库」的目录
   · 把 <知识库链接> 下载到桌面；或只下载其中「目录A/目录B」
   · 发一个文档链接，直接问「这篇讲了什么」
@@ -1717,6 +2004,9 @@ const SAY_EXAMPLES = `你可以这样对 AI 说：
   · 把 D:\\文档\\周报.md 发到语雀「某某知识库」的「某目录」下
   · 帮我把刚才的内容整理成文档，发到语雀「某某知识库」
   · 把这篇文档里的「旧说法」改成「新说法」：<文档链接>
+  · 把这篇文档的标题改成「新标题」：<文档链接>
+  · 把 D:\\文档\\清单.md 里的表格建成语雀表格，放到「某某知识库」
+  · 看看这篇文档的评论都说了什么：<文档链接>
   · 删除我建的这篇文档：<文档链接>（只能删自己创建的）
   · 更新语雀 skill ／ 更新语雀 cookie，已复制 ／ 删除语雀 cookie`;
 
@@ -1895,7 +2185,7 @@ async function autoUpdate() {
 }
 
 // ---------- 入口 ----------
-const HELP = `li-yuque-skills ${VERSION}：语雀文档读取、下载、新建、修改、删除
+const HELP = `li-yuque-skills ${VERSION}：语雀文档读取、搜索、下载、看评论、新建、修改、删除
 
 用法：node yuque.mjs <命令> [参数]
 第一次用、或不知道下一步做什么：运行 guide
@@ -1909,16 +2199,21 @@ const HELP = `li-yuque-skills ${VERSION}：语雀文档读取、下载、新建�
   books                       列出我的知识库和团队/空间知识库
   read <文档链接...> [--max-mb 附件大小上限]
                               直接读取文档或表格（输出到终端）；图片和附件下载到本机临时目录，附件默认单个不超过 ${DEFAULT_MAX_MB} MB
-  search <关键词> [--book 知识库名或链接] [--limit 条数]
-                              按目录和标题模糊搜索文档（不填 --book 则搜全部可访问的知识库）
+  search <关键词> [--body] [--book 知识库名或链接] [--limit 条数]
+                              按目录和标题模糊搜索文档（不填 --book 则搜全部可访问的知识库）；
+                              加 --body 用语雀的搜索按正文内容找，输出标题、知识库、链接和摘要
+  comments <文档或表格链接> [--limit 楼层数]
+                              读取评论（含回复和划词原文），默认最多 50 层
   toc  <知识库名或链接> [--dir 目录/子目录] [--depth 层数]
                               查看目录结构
   pull <知识库名、知识库链接或文档链接> [--dir 目录/子目录] [--out 本地目录] [--max-mb 附件大小上限] [--yes]
                               下载为 Markdown（表格转成 Markdown 表格），图片存到同目录 img/，附件存到 files/（默认单个不超过 ${DEFAULT_MAX_MB} MB）
-  add  <md文件> --book <知识库名或链接> [--under 目录/子目录] [--title 标题] [--yes]
-                              新建文档；不加 --yes 只预览不写入
+  add  <md文件> --book <知识库名或链接> [--under 目录/子目录] [--title 标题] [--sheet] [--yes]
+                              新建文档；加 --sheet 把文件里的 Markdown 表格建成语雀表格（每个「## 名称」一个工作表）；不加 --yes 只预览不写入
   edit <文档或表格链接> <md文件> [--title 标题] [--yes]
                               用本地 Markdown 替换文档全文；表格按 read 输出的 Markdown 表格逐格合并写回（需有编辑权限）；不加 --yes 只预览
+  edit <文档或表格链接> --title 新标题 [--yes]
+                              只改标题，正文不动（需有编辑权限）；不加 --yes 只预览
   delete <文档或表格链接> [--yes]
                               删除自己创建、且没有子文档的文档或表格（进回收站）；不加 --yes 只预览
 
@@ -1932,7 +2227,7 @@ async function main() {
   const table = {
     guide: cmdGuide, login: cmdLogin, logout: cmdLogout, whoami: cmdWhoami, version: cmdVersion, update: cmdUpdate,
     books: cmdBooks, search: cmdSearch, read: cmdRead, toc: cmdToc, pull: cmdPull, add: cmdAdd,
-    edit: cmdEdit, delete: cmdDelete,
+    edit: cmdEdit, delete: cmdDelete, comments: cmdComments,
   };
   if (!cmd || args.help || !table[cmd]) { console.log(HELP); return; }
   // 命令出错也照常保存续期的 cookie、做每日更新（新版可能正好修了这个错）
