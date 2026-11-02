@@ -16,7 +16,7 @@ import { pipeline } from 'node:stream/promises';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.10.0';
+const VERSION = '0.10.1';
 // 更新来源：GitHub 原始文件优先，访问不了时用 jsDelivr 镜像（可能滞后几小时）
 const REPO = 'xiaoli1999/li-yuque-skills';
 const BRANCH = 'master';
@@ -1116,6 +1116,8 @@ async function cmdEdit(args) {
   console.log(`  语雀上最后修改：${remoteAt}${editor ? `（${editor.trim()}）` : ''}${doc.status === 0 ? '；这篇目前是草稿，改完仍是草稿' : ''}`);
   console.log(`  标题：${title === doc.title ? '不变' : `「${doc.title}」→「${title}」`}`);
   console.log(`  语雀上现在约 ${doc.word_count || 0} 字，会被下面的新内容整篇替换`);
+  // 有未发布的修改时提醒：整篇替换会把它们一起覆盖。只提醒不拒绝
+  if (doc.content_modified === true) console.log(`  ⚠ 这篇有未发布的修改（最后编辑：${String(editor || '').trim() || '未知'} ${remoteAt}），整篇替换会把它们一起覆盖`);
   printLocals(md, locals);
   if (base && base[1] < remoteAt) console.log(`  ⚠ 你的底稿是 ${base[1]} 的版本，之后语雀上又被改过（${remoteAt}）。直接覆盖会丢掉这些改动，建议先重新读取最新内容再改。`);
   console.log('  提醒：Markdown 表达不了的样式（字体颜色、卡片、合并单元格等）会丢失；语雀保留历史版本，改错了可以在文档的「历史版本」里恢复。');
@@ -1568,6 +1570,39 @@ const blankOuter = () => ({ format: 'lakesheet', version: '3.5.5', larkJson: tru
 const randomStr = (n, abc) => Array.from(crypto.randomBytes(n), b => abc[b % abc.length]).join('');
 const ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 
+// 比较两份表格正文渲染后的单元格文字：工作表数量、名称、顺序必须一致，各表非空单元格「行:列 → 文字」必须相同。
+// 合并单元格、行高列宽、筛选、样式不参与（按单元格合并写回不会改回这些，只会连带发布）。解不开时按不一致处理。
+function sheetTextDiffers(a, b) {
+  const pick = body => {
+    const outer = JSON.parse(body);
+    const sheets = outer && outer.sheet ? unpackSheets(outer.sheet) : [];
+    if (!Array.isArray(sheets)) throw new Error('sheet 不是数组');
+    return sheets.map(sh => {
+      const types = (sh && sh.vStore && sh.vStore.type) || [];
+      const cells = new Map();
+      for (const [r, line] of Object.entries((sh && sh.data) || {})) {
+        for (const [c, cell] of Object.entries(line || {})) {
+          const t = cellText(cell, types).trim();
+          if (t) cells.set(`${r}:${c}`, t);
+        }
+      }
+      return { name: sh && sh.name, index: sh && sh.index, cells };
+    });
+  };
+  try {
+    const A = pick(a), B = pick(b);
+    if (A.length !== B.length) return true;
+    return A.some((x, i) => {
+      const y = B[i];
+      if (x.name !== y.name || x.index !== y.index || x.cells.size !== y.cells.size) return true;
+      for (const [k, t] of x.cells) if (y.cells.get(k) !== t) return true;
+      return false;
+    });
+  } catch { return true; }
+}
+// 编辑页数据里，草稿（body_draft）和已发布版（body）的单元格文字不同 = 有未发布的修改。还没发布过（body 为空）时不算
+const hasUnpublishedSheet = d => !!(d && d.body && d.body_draft) && d.body !== d.body_draft && sheetTextDiffers(d.body, d.body_draft);
+
 // 在当前正文（body_draft）上合并整份 Markdown。返回 { results, untouched, changed, next（新正文，没变化时为 null）, vessels }
 function mergeWorkbook(bodyDraft, md) {
   let outer = null, sheets = [blankSheet()];
@@ -1727,6 +1762,7 @@ async function addSheet(args, { book, parent, title, md, locals }) {
   if (!synced) console.log(`注意：表格内容已保存为草稿，但没能发布。请到网页上打开这张表点「发布」：${docUrl}`);
 }
 
+const SELF_OPEN = '你自己的编辑页还开着这张表，请关掉后等约一分钟再试。';
 async function editSheet(args, { book, doc, url, abilities }, abs) {
   let md = fs.readFileSync(abs, 'utf8').replace(/^﻿/, '');
   const base = [...md.matchAll(META_RE)].find(m => m[1] && m[2].split(/[?#]/)[0].endsWith(`/${book.docSlug}`));
@@ -1735,7 +1771,7 @@ async function editSheet(args, { book, doc, url, abilities }, abs) {
   const title = String(args.title || (h1 && h1[1]) || doc.title).trim();
   if (h1 && h1[1].trim() === title) md = md.slice(h1[0].length);
 
-  // 写前检查：编辑权限、协同模式、有没有人正在编辑
+  // 写前检查：编辑权限、编辑模式、有没有人正在编辑
   const editUrl = `https://${book.host}/api/docs/${encodeURIComponent(book.docSlug)}?book_id=${book.id}&merge_dynamic_data=false&mode=edit`;
   const lockUrl = `https://${book.host}/api/docs/${doc.id}/lock`;
   const e = (await yq(editUrl)).data || {};
@@ -1746,11 +1782,15 @@ async function editSheet(args, { book, doc, url, abilities }, abs) {
   const who = x => String((x && x.name) || '').trim() || '其他人';
   if (!(e.abilities || abilities).update) throw new UserError(`没有「${doc.title}」的编辑权限：${url}`);
   if (!editType) throw new UserError('没能确认这张表的编辑模式（语雀页面可能改版了），为安全起见暂不修改。');
-  if (/collab/i.test(editType)) throw new UserError('这张表是协同编辑模式，暂不支持脚本修改，请到语雀网页上改。');
+  // 协同模式（SheetCollab）：没人在线时用和单人编辑相同的写法写入；不加文档锁，写入前再查一次有没有人在线
+  const collab = /collab/i.test(editType);
   const members = Array.isArray(lock.collab_members) ? lock.collab_members : [];
-  if (members.length) throw new UserError(`${members.map(who).join('、')} 正在编辑这张表，请等对方关闭编辑页后再改。`);
   const locker = lock.locker || e.locker;
-  if (locker && locker.id !== me.id) throw new UserError(`${who(locker)} 正在编辑这张表，请等对方关闭编辑页后再改。`);
+  // 有别人在线就拒绝；在线的只有自己（自己的编辑页没关）时单独提示。单人编辑模式下锁在自己手里照旧放行，预览里提醒
+  const isMe = x => !!x && me.id != null && x.id === me.id;
+  const others = [...members, ...(locker ? [locker] : [])].filter(x => !isMe(x));
+  if (others.length) throw new UserError(`${[...new Set(others.map(who))].join('、')} 正在编辑这张表，请等对方关闭编辑页后再改。`);
+  if (members.length || (collab && locker)) throw new UserError(SELF_OPEN);
 
   const locals = scanLocalFiles(md, path.dirname(abs));
   const imgs = locals.filter(f => f.kind === 'image' && f.exists);
@@ -1762,8 +1802,16 @@ async function editSheet(args, { book, doc, url, abilities }, abs) {
   console.log('修改预览（表格）：');
   console.log(`  文档：${doc.title}  ${url}`);
   console.log(`  知识库：${book.name}`);
+  if (collab) console.log('  编辑模式：多人协同（没人在线时才能写入）');
   console.log(`  语雀上最后修改：${remoteAt}${editor ? `（${editor.trim()}）` : ''}${e.status === 0 ? '；这张表目前是草稿，修改后会发布' : ''}`);
   console.log(`  标题：${titleChanged ? `「${doc.title}」→「${title}」` : '不变'}`);
+  // 有未发布的修改时不写入：read 读到的是已发布版，在草稿上合并会把这些修改当成要改回去的格
+  if (hasUnpublishedSheet(e)) {
+    console.log(`  ⚠ 语雀上有未发布的修改（最后编辑：${String(editor || '').trim() || '未知'} ${remoteAt}），和你读到的已发布内容不一致。为避免覆盖这些修改，不写入。请让用户到网页上打开这张表点「更新」发布（或放弃草稿），然后重新 read 再改。`);
+    if (args.yes) throw new UserError('没有写入：语雀上有未发布的修改。请到网页上打开这张表点「更新」发布（或放弃草稿），然后重新 read 再改。');
+    console.log('\n这是预览，没有写入；上面的问题处理之前不能写入。');
+    return;
+  }
   if (!m1.changed && !titleChanged) {
     console.log('\n没有变化：文件里的表格和语雀上现在的内容一致，不需要写入。');
     return;
@@ -1800,18 +1848,31 @@ async function editSheet(args, { book, doc, url, abilities }, abs) {
   if (stale) throw new UserError(`没有写入：底稿是 ${base[1]} 的版本，语雀上之后又被改过（${remoteAt}）。请重新 read 最新内容，在它的基础上修改后再试。`);
 
   if (imgs.length) md = await uploadLocals(book, doc.id, md, imgs);
-  const uuid = randomStr(10, 'abcdefghijklmnopqrstuvwxyz');
-  try {
-    await yq(lockUrl, { method: 'PUT', json: { uuid } });
-  } catch (err) {
-    if (err instanceof LoginError) throw err;
-    throw new UserError(`没能锁定这张表（${err.message}），可能有人刚打开了编辑页，请稍后再试。没有写入任何内容。`);
+  // 文档锁是单人编辑模式的机制，协同模式不加锁
+  const uuid = collab ? null : randomStr(10, 'abcdefghijklmnopqrstuvwxyz');
+  if (!collab) {
+    try {
+      await yq(lockUrl, { method: 'PUT', json: { uuid } });
+    } catch (err) {
+      if (err instanceof LoginError) throw err;
+      throw new UserError(`没能锁定这张表（${err.message}），可能有人刚打开了编辑页，请稍后再试。没有写入任何内容。`);
+    }
   }
   let backup = null, synced = true, wrote = false;
   try {
-    // 加锁后重新读取最新内容，在它上面重新合并
+    // 写入前重新读取最新内容，在它上面重新合并
     const e2 = (await yq(editUrl)).data || {};
-    if (e2.locker && e2.locker.uuid && e2.locker.uuid !== uuid) throw new UserError('加锁后发现有人同时在编辑这张表，已放弃写入。');
+    if (collab) {
+      // 协同模式：同时再查一次有没有人在线
+      const l2 = (((await yq(lockUrl)).data || {}).doc) || {};
+      const m2s = Array.isArray(l2.collab_members) ? l2.collab_members : [];
+      const k2 = l2.locker || e2.locker;
+      const busy = [...m2s, ...(k2 ? [k2] : [])];
+      const o2 = busy.filter(x => !isMe(x));
+      if (o2.length) throw new UserError(`有人刚打开了编辑页（${[...new Set(o2.map(who))].join('、')}），已放弃写入，没有写入任何内容。请等对方关掉编辑页约一分钟后再试。`);
+      if (busy.length) throw new UserError(`${SELF_OPEN}没有写入任何内容。`);
+    } else if (e2.locker && e2.locker.uuid && e2.locker.uuid !== uuid) throw new UserError('加锁后发现有人同时在编辑这张表，已放弃写入。');
+    if (hasUnpublishedSheet(e2)) throw new UserError('写入前发现语雀上刚有未发布的修改，已放弃写入，没有写入任何内容。请到网页上点「更新」发布（或放弃草稿）后，重新 read 再改。');
     const m2 = mergeWorkbook(e2.body_draft || '', md);
     if (m2.changed) {
       const next = m2.next;
@@ -1851,7 +1912,7 @@ async function editSheet(args, { book, doc, url, abilities }, abs) {
       }
     }
   } finally {
-    try { await yq(`${lockUrl}?uuid=${uuid}`, { method: 'DELETE' }); } catch { console.log('\n注意：释放编辑锁失败，一段时间后会自动失效；期间在网页上打开编辑可能提示有人在编辑。'); }
+    if (!collab) try { await yq(`${lockUrl}?uuid=${uuid}`, { method: 'DELETE' }); } catch { console.log('\n注意：释放编辑锁失败，一段时间后会自动失效；期间在网页上打开编辑可能提示有人在编辑。'); }
   }
   console.log(`\n已修改：${title}\n链接：${url}`);
   if (backup) console.log(`写入前的内容已备份到：${backup}`);
